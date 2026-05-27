@@ -1,0 +1,35 @@
+# Python
+backend/.venv/
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+
+# Node
+frontend/node_modules/
+frontend/.next/
+frontend/out/
+
+# Data & Reports
+backend/data/cache/*.csv
+backend/data/cache/*.parquet
+backend/reports/*.html
+backend/state/*.json
+
+# Secrets
+.env
+*.local
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
