@@ -6,22 +6,26 @@ Spätere Etappen ergänzen /backtest, /bot, /chat, /trades, /tuner, /ws.
 from __future__ import annotations
 
 import logging
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from typing import Literal
 
 import pandas as pd
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, WebSocket
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pathlib import Path
 from pydantic import BaseModel, Field
 
+from src.api import ws as ws_hub
 from src.backtest import run_backtest
 from src.backtest.report import REPORT_DIR, render_html
 from src.backtest.walkforward import WalkForwardResult, run_walk_forward
 from src.brokers.capital_com import CapitalAPIError, CapitalAuthError
 from src.config import EPIC_MAP, RESOLUTION_MAP, config
 from src.data.fetcher import load_candles
+from src.live import get_orchestrator
+from src.live.orchestrator import shutdown_orchestrator
 from src.strategy_core import evaluate as evaluate_signal
 from src.strategy_core.bias import compute_bias
 from src.strategy_core.liquidity import liquidity_levels
@@ -32,10 +36,28 @@ from src.strategy_core.sweep import detect_sweeps
 
 logging.basicConfig(level=config.log_level.upper())
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """FastAPI-Lifecycle. Lädt persistierten Bot-State beim Start, stoppt sauber."""
+    orch = get_orchestrator()
+    log = logging.getLogger("trading-v2")
+    log.info(
+        "Bot-Orchestrator initialisiert: open_trades=%d, closed_trades=%d, equity=%.2f",
+        len(orch.state.open_trades),
+        len(orch.state.closed_trades),
+        orch.state.equity,
+    )
+    yield
+    await shutdown_orchestrator()
+    log.info("Backend-Shutdown — Bot gestoppt, State persistiert")
+
+
 app = FastAPI(
     title="trading-v2 Backend",
     version="0.1.0",
     description="ICT Multi-TF Bot + Backtest + Chat — Bot v2 Greenfield",
+    lifespan=lifespan,
 )
 
 # Frontend (Next.js, Etappe 4) darf cross-origin zugreifen
@@ -131,12 +153,13 @@ class SignalResponse(BaseModel):
 @app.get("/health", response_model=HealthResponse)
 def health() -> HealthResponse:
     """Smoke-Test-Endpoint. Liefert Backend-Status + Verbindungs-Indikatoren."""
+    orch = get_orchestrator()
     return HealthResponse(
         status="ok",
-        version="0.1.0",
+        version="0.2.0",
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
-        bot_running=False,  # Etappe 5
-        broker_connected=False,  # Etappe 1
+        bot_running=orch.is_running(),
+        broker_connected=config.broker_configured,
     )
 
 
@@ -605,3 +628,91 @@ async def diagnose(
             }
 
     return result
+
+
+# ─── Live-Bot ────────────────────────────────────────────────────────────
+
+
+class BotStartRequest(BaseModel):
+    initial_capital: float | None = Field(default=None, ge=100.0)
+    tick_interval_s: int | None = Field(default=None, ge=10, le=600)
+    instruments: list[InstrumentName] | None = None
+    rr_threshold: float | None = Field(default=None, ge=1.0, le=5.0)
+    risk_pct: float | None = Field(default=None, ge=0.001, le=0.05)
+    sweep_lookback: int | None = Field(default=None, ge=3, le=50)
+    reset: bool = Field(default=False, description="Trades + Equity zurücksetzen vor Start")
+
+
+class BotStateResponse(BaseModel):
+    running: bool
+    started_at: str | None
+    stopped_at: str | None
+    last_tick: str | None
+    last_signal_check: str | None
+    tick_interval_s: int
+    initial_capital: float
+    equity: float
+    instruments: list[str]
+    open_trades: list[dict]
+    closed_trades: list[dict]
+    last_error: str | None
+    rr_threshold: float
+    risk_pct: float
+    sweep_lookback: int
+    n_ws_clients: int
+
+
+def _state_to_response() -> BotStateResponse:
+    orch = get_orchestrator()
+    d = orch.state.to_json()
+    d["n_ws_clients"] = ws_hub.n_clients()
+    return BotStateResponse(**d)
+
+
+@app.get("/bot/state", response_model=BotStateResponse)
+def bot_state() -> BotStateResponse:
+    """Aktueller Bot-State — auch wenn der Bot nicht läuft."""
+    return _state_to_response()
+
+
+@app.post("/bot/start", response_model=BotStateResponse)
+async def bot_start(req: BotStartRequest) -> BotStateResponse:
+    """Startet den Tick-Loop. Idempotent: wenn er schon läuft, gibt aktuellen State."""
+    orch = get_orchestrator()
+    await orch.start(
+        initial_capital=req.initial_capital,
+        tick_interval_s=req.tick_interval_s,
+        instruments=req.instruments,
+        rr_threshold=req.rr_threshold,
+        risk_pct=req.risk_pct,
+        sweep_lookback=req.sweep_lookback,
+        reset=req.reset,
+    )
+    await ws_hub.push_to_dashboard({"type": "state", "state": orch.state.to_json()})
+    return _state_to_response()
+
+
+@app.post("/bot/stop", response_model=BotStateResponse)
+async def bot_stop() -> BotStateResponse:
+    """Stoppt den Tick-Loop. State (offene Trades, Equity) bleibt erhalten."""
+    orch = get_orchestrator()
+    await orch.stop()
+    await ws_hub.push_to_dashboard({"type": "state", "state": orch.state.to_json()})
+    return _state_to_response()
+
+
+@app.post("/bot/reset", response_model=BotStateResponse)
+async def bot_reset() -> BotStateResponse:
+    """Komplett-Reset: stoppt Bot, leert Trades, Equity = initial_capital."""
+    orch = get_orchestrator()
+    await orch.reset()
+    await ws_hub.push_to_dashboard({"type": "state", "state": orch.state.to_json()})
+    return _state_to_response()
+
+
+@app.websocket("/ws/live")
+async def ws_live(ws: WebSocket) -> None:
+    """WebSocket für Live-Updates — sendet zunächst kompletten State, dann Push pro Event."""
+    orch = get_orchestrator()
+    initial = {"type": "state", "state": orch.state.to_json()}
+    await ws_hub.handle_client(ws, initial_message=initial)

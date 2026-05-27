@@ -136,3 +136,86 @@ export async function runBacktest(req: BacktestRequest): Promise<BacktestRespons
   }
   return res.json();
 }
+
+// ─── Live Bot ──────────────────────────────────────────────────────────
+
+export interface OpenTrade {
+  id: string;
+  instrument: string;
+  side: "long" | "short";
+  open_time: string;
+  entry: number;
+  sl: number;
+  tp: number;
+  size: number;
+  variant: "primary" | "ob_retest" | "fvg_retest" | "ultimate";
+  htf_used: string;
+  ltf_used: string;
+  rr_at_open: number;
+}
+
+export interface ClosedTrade extends OpenTrade {
+  close_time: string;
+  exit: number;
+  pnl_abs: number;
+  pnl_pct: number;
+  r_multiple: number;
+  exit_reason: "sl" | "tp" | "manual" | "bot_stopped";
+}
+
+export interface BotState {
+  running: boolean;
+  started_at: string | null;
+  stopped_at: string | null;
+  last_tick: string | null;
+  last_signal_check: string | null;
+  tick_interval_s: number;
+  initial_capital: number;
+  equity: number;
+  instruments: string[];
+  open_trades: OpenTrade[];
+  closed_trades: ClosedTrade[];
+  last_error: string | null;
+  rr_threshold: number;
+  risk_pct: number;
+  sweep_lookback: number;
+  n_ws_clients?: number;
+}
+
+export interface BotStartRequest {
+  initial_capital?: number;
+  tick_interval_s?: number;
+  instruments?: Instrument[];
+  rr_threshold?: number;
+  risk_pct?: number;
+  sweep_lookback?: number;
+  reset?: boolean;
+}
+
+export async function fetchBotState(): Promise<BotState> {
+  const res = await fetch(`${BASE}/bot/state`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`bot/state ${res.status}`);
+  return res.json();
+}
+
+export async function startBot(req: BotStartRequest = {}): Promise<BotState> {
+  const res = await fetch(`${BASE}/bot/start`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+  if (!res.ok) throw new Error(`bot/start ${res.status}`);
+  return res.json();
+}
+
+export async function stopBot(): Promise<BotState> {
+  const res = await fetch(`${BASE}/bot/stop`, { method: "POST" });
+  if (!res.ok) throw new Error(`bot/stop ${res.status}`);
+  return res.json();
+}
+
+export async function resetBot(): Promise<BotState> {
+  const res = await fetch(`${BASE}/bot/reset`, { method: "POST" });
+  if (!res.ok) throw new Error(`bot/reset ${res.status}`);
+  return res.json();
+}
