@@ -99,6 +99,24 @@ class BotOrchestrator:
                  len(self.state.open_trades), len(self.state.closed_trades))
         return self.state
 
+    # ── Config-Mutation (vom Chat-Apply aufgerufen) ─────────────────────
+    async def apply_config_diff(self, diff: dict) -> BotState:
+        """Wendet einen Key-Value-Diff auf State an. Atomic + persistiert.
+
+        Nur Whitelisted-Keys; raised KeyError bei unbekanntem Key. Aufrufer
+        (chat/proposals/{id}/apply) hat die Whitelist schon in tools.py geprüft.
+        """
+        allowed = {"rr_threshold", "risk_pct", "sweep_lookback",
+                   "tick_interval_s", "instruments"}
+        async with self._state_lock:
+            for key, value in diff.items():
+                if key not in allowed:
+                    raise KeyError(f"Key '{key}' nicht in Apply-Whitelist {sorted(allowed)}")
+                setattr(self.state, key, value)
+            save_state(self.state)
+        log.info("Config-Diff angewendet: %s", diff)
+        return self.state
+
     # ── Reset (force) ───────────────────────────────────────────────────
     async def reset(self) -> BotState:
         """Komplett-Reset: stoppt Bot (falls läuft), leert Trade-Listen, Equity = initial."""

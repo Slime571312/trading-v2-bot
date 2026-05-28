@@ -219,3 +219,110 @@ export async function resetBot(): Promise<BotState> {
   if (!res.ok) throw new Error(`bot/reset ${res.status}`);
   return res.json();
 }
+
+// ─── Chat ──────────────────────────────────────────────────────────────
+
+export type ChatModel = "claude-sonnet-4-6" | "claude-opus-4-7" | "claude-haiku-4-5-20251001";
+
+export interface ToolCall {
+  name: string;
+  input: Record<string, unknown>;
+  output: string;
+  iteration: number;
+}
+
+export interface ChatMessageResponse {
+  conversation_id: string;
+  reply: string;
+  tool_calls: ToolCall[];
+  iterations: number;
+  model_used: string;
+  usage: {
+    input_tokens: number;
+    output_tokens: number;
+    cache_creation_input_tokens: number;
+    cache_read_input_tokens: number;
+  };
+}
+
+export interface ConversationSummary {
+  id: string;
+  created_at: string;
+  title: string;
+  n_messages: number;
+  model: string;
+}
+
+export interface ConversationDetail extends ConversationSummary {
+  messages: Array<{
+    role: "user" | "assistant";
+    content: string | Array<Record<string, unknown>>;
+  }>;
+}
+
+export interface Proposal {
+  id: string;
+  created_at: string;
+  diff: Record<string, unknown>;
+  rationale: string;
+  status: "pending" | "applied" | "rejected";
+  applied_at: string | null;
+  rejected_at: string | null;
+  conversation_id: string | null;
+}
+
+export async function sendChatMessage(
+  message: string,
+  conversation_id?: string,
+  model?: ChatModel,
+): Promise<ChatMessageResponse> {
+  const res = await fetch(`${BASE}/chat/message`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ message, conversation_id, model }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `chat ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function listConversations(): Promise<ConversationSummary[]> {
+  const res = await fetch(`${BASE}/chat/conversations`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`conversations ${res.status}`);
+  return res.json();
+}
+
+export async function getConversation(id: string): Promise<ConversationDetail> {
+  const res = await fetch(`${BASE}/chat/conversations/${id}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`conversation ${res.status}`);
+  return res.json();
+}
+
+export async function deleteConversation(id: string): Promise<void> {
+  const res = await fetch(`${BASE}/chat/conversations/${id}`, { method: "DELETE" });
+  if (!res.ok) throw new Error(`delete ${res.status}`);
+}
+
+export async function listProposals(status?: "pending" | "applied" | "rejected"): Promise<Proposal[]> {
+  const url = status ? `${BASE}/chat/proposals?status=${status}` : `${BASE}/chat/proposals`;
+  const res = await fetch(url, { cache: "no-store" });
+  if (!res.ok) throw new Error(`proposals ${res.status}`);
+  return res.json();
+}
+
+export async function applyProposal(id: string): Promise<Proposal> {
+  const res = await fetch(`${BASE}/chat/proposals/${id}/apply`, { method: "POST" });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `apply ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function rejectProposal(id: string): Promise<Proposal> {
+  const res = await fetch(`${BASE}/chat/proposals/${id}/reject`, { method: "POST" });
+  if (!res.ok) throw new Error(`reject ${res.status}`);
+  return res.json();
+}

@@ -28,7 +28,7 @@ Jede Etappe wird **erst abgeschlossen + verifiziert** bevor die nächste startet
 | ✓ | **3** | Backtest-Engine | Bar-für-Bar-Replay, realistisches Slippage/Spread-Modell, Equity-Curve, HTML-Report (Bokeh), Walk-Forward-Skeleton (rollende OOS-Fenster); `POST /backtest`-Endpoint; 31/31 Tests grün |
 | ✓ | **4** | Frontend-Skeleton | Next.js 15 + Tailwind v4; Dashboard (4 Signal-Cards, Auto-Refresh 30s), Backtest-View (Form + Metriken-Grid + TradingView-Equity-Chart + Trade-Liste + WFO-Badges), Live/Chat-Stubs; Build grün (5 Routen) |
 | ✓ | **5** | Live-Paper-Bot | Asyncio-Tick-Loop (REST-Poll, 60s default) ruft Strategy-Core, Paper-Broker mit Slippage-Modell (shared mit Backtest), intrabar SL/TP-Check, atomar persistierte JSON-State; FastAPI-WebSocket `/ws/live` mit Fan-Out/Backpressure/Heartbeat → Browser-Live-Push; `/bot/{state,start,stop,reset}` Endpoints; Live-View mit Auto-Reconnect-Hook; 48/48 Tests; Live-Smoke: BTC short @ 75370 mit RR 3.47 opened |
-|   | **6** | Chat-Bot | Anthropic-SDK, Tool-Use (`read_status`, `run_backtest`, `propose_config_diff`), Multi-Turn |
+| ✓ | **6** | Chat-Bot | Anthropic Claude API (Sonnet 4.6 Default, Opus 4.7 + Haiku 4.5 wählbar); 6 Tools: `read_status`, `get_recent_trades`, `get_signal`, `diagnose`, `run_backtest`, `propose_config_diff`; Multi-Turn-Tool-Loop mit Prompt-Caching (System + Tools); Conversation-Persistenz (JSON); Proposal-Queue (Read+Trigger+Vorschlag-Scope, Direkt-Apply braucht User-Klick); Frontend: Chat-UI mit Tool-Use-Badges + Proposals-Panel; 60/60 Tests |
 |   | **7** | Self-Improve-Tuner | Nightly launchd-Job, Walk-Forward 30/60d, Param-Diff im Dashboard, Approval-Flow |
 
 ## Setup

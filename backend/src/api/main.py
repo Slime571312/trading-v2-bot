@@ -22,6 +22,7 @@ from src.backtest import run_backtest
 from src.backtest.report import REPORT_DIR, render_html
 from src.backtest.walkforward import WalkForwardResult, run_walk_forward
 from src.brokers.capital_com import CapitalAPIError, CapitalAuthError
+from src.chat import get_chat_client, get_chat_state
 from src.config import EPIC_MAP, RESOLUTION_MAP, config
 from src.data.fetcher import load_candles
 from src.live import get_orchestrator
@@ -716,3 +717,177 @@ async def ws_live(ws: WebSocket) -> None:
     orch = get_orchestrator()
     initial = {"type": "state", "state": orch.state.to_json()}
     await ws_hub.handle_client(ws, initial_message=initial)
+
+
+# ─── Chat-Bot ────────────────────────────────────────────────────────────
+
+
+class ChatMessageRequest(BaseModel):
+    conversation_id: str | None = Field(default=None,
+                                         description="None → neue Konversation wird erzeugt")
+    message: str = Field(min_length=1, max_length=8000)
+    model: str | None = Field(default=None,
+                               description="claude-sonnet-4-6 (Default) | claude-opus-4-7 | claude-haiku-4-5-20251001")
+
+
+class ToolCallOut(BaseModel):
+    name: str
+    input: dict
+    output: str
+    iteration: int
+
+
+class ChatMessageResponse(BaseModel):
+    conversation_id: str
+    reply: str
+    tool_calls: list[ToolCallOut]
+    iterations: int
+    model_used: str
+    usage: dict[str, int]
+
+
+class ConversationOut(BaseModel):
+    id: str
+    created_at: str
+    title: str
+    n_messages: int
+    model: str
+
+
+class ConversationDetailOut(ConversationOut):
+    messages: list[dict]
+
+
+class ProposalOut(BaseModel):
+    id: str
+    created_at: str
+    diff: dict
+    rationale: str
+    status: str
+    applied_at: str | None
+    rejected_at: str | None
+    conversation_id: str | None
+
+
+@app.post("/chat/message", response_model=ChatMessageResponse)
+async def chat_message(req: ChatMessageRequest) -> ChatMessageResponse:
+    """Eine User-Message an Claude senden. Erzeugt neue Konversation wenn keine angegeben."""
+    if not config.anthropic_api_key:
+        raise HTTPException(503, "ANTHROPIC_API_KEY nicht gesetzt — Chat deaktiviert")
+
+    state = get_chat_state()
+    client = get_chat_client()
+
+    conv = state.get(req.conversation_id) if req.conversation_id else None
+    if conv is None:
+        conv = state.new_conversation(model=req.model or "claude-sonnet-4-6")
+
+    new_user_msg = {"role": "user", "content": req.message}
+    full_messages = conv.messages + [new_user_msg]
+
+    try:
+        result = await client.run_turn(
+            messages=full_messages,
+            model=req.model or conv.model,
+            conversation_id=conv.id,
+        )
+    except Exception as e:
+        logging.getLogger(__name__).exception("chat-call gescheitert: %s", e)
+        raise HTTPException(500, f"Chat-Call gescheitert: {type(e).__name__}: {e}")
+
+    # User-Message + alle vom Loop erzeugten Messages persistieren
+    state.append_messages(conv.id, [new_user_msg, *result.new_messages])
+
+    # Erste User-Frage wird Titel (kurz halten)
+    if len(conv.messages) == 0:
+        title = req.message.strip().split("\n")[0][:60]
+        state.update_title(conv.id, title)
+
+    return ChatMessageResponse(
+        conversation_id=conv.id,
+        reply=result.text,
+        tool_calls=[
+            ToolCallOut(name=t.name, input=t.input, output=t.output, iteration=t.iteration)
+            for t in result.tool_calls
+        ],
+        iterations=result.iterations,
+        model_used=result.model_used,
+        usage=result.usage,
+    )
+
+
+@app.get("/chat/conversations", response_model=list[ConversationOut])
+def chat_list() -> list[ConversationOut]:
+    state = get_chat_state()
+    return [
+        ConversationOut(
+            id=c.id, created_at=c.created_at, title=c.title,
+            n_messages=len(c.messages), model=c.model,
+        )
+        for c in state.list_conversations()
+    ]
+
+
+@app.get("/chat/conversations/{conv_id}", response_model=ConversationDetailOut)
+def chat_get(conv_id: str) -> ConversationDetailOut:
+    state = get_chat_state()
+    conv = state.get(conv_id)
+    if not conv:
+        raise HTTPException(404, f"Konversation {conv_id} nicht gefunden")
+    return ConversationDetailOut(
+        id=conv.id, created_at=conv.created_at, title=conv.title,
+        n_messages=len(conv.messages), model=conv.model, messages=conv.messages,
+    )
+
+
+@app.delete("/chat/conversations/{conv_id}")
+def chat_delete(conv_id: str) -> dict:
+    state = get_chat_state()
+    if not state.delete(conv_id):
+        raise HTTPException(404, f"Konversation {conv_id} nicht gefunden")
+    return {"deleted": conv_id}
+
+
+@app.get("/chat/proposals", response_model=list[ProposalOut])
+def chat_proposals(
+    status: Literal["pending", "applied", "rejected"] | None = None,
+) -> list[ProposalOut]:
+    state = get_chat_state()
+    return [
+        ProposalOut(**p.to_json()) for p in state.list_proposals(status=status)
+    ]
+
+
+@app.post("/chat/proposals/{prop_id}/apply", response_model=ProposalOut)
+async def chat_proposal_apply(prop_id: str) -> ProposalOut:
+    """Wendet einen Config-Diff-Vorschlag auf den BotState an."""
+    state = get_chat_state()
+    proposal = state.get_proposal(prop_id)
+    if not proposal:
+        raise HTTPException(404, f"Vorschlag {prop_id} nicht gefunden")
+    if proposal.status != "pending":
+        raise HTTPException(409, f"Vorschlag bereits {proposal.status}")
+
+    orch = get_orchestrator()
+    try:
+        await orch.apply_config_diff(proposal.diff)
+    except KeyError as e:
+        raise HTTPException(400, str(e))
+
+    state.mark_proposal(prop_id, "applied")
+    refreshed = state.get_proposal(prop_id)
+    await ws_hub.push_to_dashboard({"type": "state", "state": orch.state.to_json()})
+    return ProposalOut(**refreshed.to_json())
+
+
+@app.post("/chat/proposals/{prop_id}/reject", response_model=ProposalOut)
+def chat_proposal_reject(prop_id: str) -> ProposalOut:
+    state = get_chat_state()
+    proposal = state.get_proposal(prop_id)
+    if not proposal:
+        raise HTTPException(404, f"Vorschlag {prop_id} nicht gefunden")
+    if proposal.status != "pending":
+        raise HTTPException(409, f"Vorschlag bereits {proposal.status}")
+    state.mark_proposal(prop_id, "rejected")
+    refreshed = state.get_proposal(prop_id)
+    return ProposalOut(**refreshed.to_json())
