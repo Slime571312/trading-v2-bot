@@ -27,6 +27,7 @@ from src.config import EPIC_MAP, RESOLUTION_MAP, config
 from src.data.fetcher import load_candles
 from src.live import get_orchestrator
 from src.live.orchestrator import shutdown_orchestrator
+from src.tuner import get_tuner
 from src.strategy_core import evaluate as evaluate_signal
 from src.strategy_core.bias import compute_bias
 from src.strategy_core.liquidity import liquidity_levels
@@ -891,3 +892,85 @@ def chat_proposal_reject(prop_id: str) -> ProposalOut:
     state.mark_proposal(prop_id, "rejected")
     refreshed = state.get_proposal(prop_id)
     return ProposalOut(**refreshed.to_json())
+
+
+# ─── Self-Improve-Tuner (Etappe 7) ──────────────────────────────────────
+
+
+class TunerRunRequest(BaseModel):
+    instruments: list[InstrumentName] | None = Field(default=None,
+                                                      description="None → nutzt Bot-State-Instrumente")
+    iter_tf: Timeframe = Field(default="5m")
+    bars: int = Field(default=1000, ge=200, le=1000)
+    use_claude: bool = Field(default=True,
+                              description="Wenn False, Template-Rationale auch wenn API-Key da")
+    triggered_by: Literal["manual", "cron"] = Field(default="manual")
+
+
+class TunerRunOut(BaseModel):
+    id: str
+    started_at: str
+    finished_at: str | None
+    status: str
+    instruments: list[str]
+    iter_tf: str
+    bars_used: int
+    results: dict[str, dict]
+    proposal_ids: list[str]
+    claude_summary: str | None
+    error: str | None
+    triggered_by: str
+
+
+class TunerStatusOut(BaseModel):
+    is_running: bool
+    current_run_id: str | None
+    n_runs_history: int
+
+
+@app.get("/tuner/status", response_model=TunerStatusOut)
+def tuner_status() -> TunerStatusOut:
+    t = get_tuner()
+    return TunerStatusOut(
+        is_running=t.is_running,
+        current_run_id=t.current_run.id if t.current_run else None,
+        n_runs_history=len(t.history.runs),
+    )
+
+
+@app.get("/tuner/history", response_model=list[TunerRunOut])
+def tuner_history(limit: int = Query(default=20, ge=1, le=50)) -> list[TunerRunOut]:
+    t = get_tuner()
+    runs = sorted(t.history.runs, key=lambda r: r.started_at, reverse=True)[:limit]
+    return [TunerRunOut(**r.to_json()) for r in runs]
+
+
+@app.get("/tuner/runs/{run_id}", response_model=TunerRunOut)
+def tuner_run_detail(run_id: str) -> TunerRunOut:
+    t = get_tuner()
+    run = next((r for r in t.history.runs if r.id == run_id), None)
+    if not run:
+        raise HTTPException(404, f"Tuner-Run {run_id} nicht gefunden")
+    return TunerRunOut(**run.to_json())
+
+
+@app.post("/tuner/run", response_model=TunerRunOut)
+async def tuner_run(req: TunerRunRequest) -> TunerRunOut:
+    """Triggert einen Tuner-Lauf. Blockt bis fertig (kann mehrere Minuten dauern).
+
+    Verhält sich idempotent bei is_running: returnt 409 statt 2× parallel zu laufen.
+    """
+    t = get_tuner()
+    if t.is_running:
+        raise HTTPException(409, f"Tuner läuft bereits (run_id={t.current_run.id})")
+    try:
+        run = await t.run(
+            instruments=req.instruments,
+            iter_tf=req.iter_tf,
+            bars=req.bars,
+            triggered_by=req.triggered_by,
+            use_claude=req.use_claude,
+        )
+    except Exception as e:
+        raise HTTPException(500, f"Tuner-Run gecrasht: {type(e).__name__}: {e}")
+    return TunerRunOut(**run.to_json())

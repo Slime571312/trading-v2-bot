@@ -11,6 +11,7 @@ const navItems = [
   { href: "/", label: "Dashboard" },
   { href: "/backtest", label: "Backtest" },
   { href: "/live", label: "Live" },
+  { href: "/tuner", label: "Tuner" },
   { href: "/chat", label: "Chat" },
 ];
 

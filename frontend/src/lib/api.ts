@@ -326,3 +326,84 @@ export async function rejectProposal(id: string): Promise<Proposal> {
   if (!res.ok) throw new Error(`reject ${res.status}`);
   return res.json();
 }
+
+// ─── Tuner ──────────────────────────────────────────────────────────────
+
+export interface GridCombo {
+  rr_threshold: number;
+  sweep_lookback: number;
+  total_trades: number;
+  win_rate: number;
+  expectancy_r: number;
+  profit_factor: number;
+  total_return_pct: number;
+  max_drawdown_pct: number;
+  sharpe: number;
+  score: number;
+}
+
+export interface GridResult {
+  instrument: string;
+  iter_tf: string;
+  bars_used: number;
+  current_rr_threshold: number;
+  current_sweep_lookback: number;
+  current_score: number | null;
+  current_too_few_trades: boolean;
+  improvement_vs_current: number | null;
+  best: GridCombo | null;
+  combos: GridCombo[];
+}
+
+export interface TunerRun {
+  id: string;
+  started_at: string;
+  finished_at: string | null;
+  status: "running" | "completed" | "failed";
+  instruments: string[];
+  iter_tf: string;
+  bars_used: number;
+  results: Record<string, GridResult | { error: string }>;
+  proposal_ids: string[];
+  claude_summary: string | null;
+  error: string | null;
+  triggered_by: "manual" | "cron";
+}
+
+export interface TunerStatus {
+  is_running: boolean;
+  current_run_id: string | null;
+  n_runs_history: number;
+}
+
+export interface TunerRunRequest {
+  instruments?: Instrument[];
+  iter_tf?: Timeframe;
+  bars?: number;
+  use_claude?: boolean;
+}
+
+export async function fetchTunerStatus(): Promise<TunerStatus> {
+  const res = await fetch(`${BASE}/tuner/status`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`tuner/status ${res.status}`);
+  return res.json();
+}
+
+export async function fetchTunerHistory(limit = 20): Promise<TunerRun[]> {
+  const res = await fetch(`${BASE}/tuner/history?limit=${limit}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`tuner/history ${res.status}`);
+  return res.json();
+}
+
+export async function runTuner(req: TunerRunRequest = {}): Promise<TunerRun> {
+  const res = await fetch(`${BASE}/tuner/run`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ ...req, triggered_by: "manual" }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({ detail: res.statusText }));
+    throw new Error(err.detail ?? `tuner/run ${res.status}`);
+  }
+  return res.json();
+}
