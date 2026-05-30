@@ -1,21 +1,32 @@
-"""Chat-Bot — Anthropic Claude API mit Tool-Use, Multi-Turn-Loop.
+"""Chat-Bot via Claude Agent SDK — nutzt Claude-Code-Subscription.
 
-Spec: Trading/Bot/Chat-Engine.md + wiki/sources/2026-05-27-anthropic-advanced-tool-use.md
-Scope (aus Decisions.md): Read ✓ · Trigger ✓ · Vorschlag ✓ · Direkt-Schreiben ✗
+Spec: Trading/Bot/Chat-Engine.md
+Agent-SDK statt direkter Anthropic-API → kein ANTHROPIC_API_KEY nötig,
+läuft über die `claude`-CLI des Users.
 
-Tools werden in tools.py definiert + dispatched. ConversationManager (in state.py)
-hält Multi-Turn-History pro conversation_id. ChatClient (in client.py) macht den
-eigentlichen Anthropic-API-Call inkl. tool-loop und prompt-caching.
+Tools werden als MCP-Server gebündelt (chat/tools.py), Multi-Turn-Loop
++ Session-Resumption übernimmt die SDK selbst (chat/client.py).
 """
+from .client import (
+    ChatClient,
+    ChatTurnResult,
+    get_chat_client,
+    is_available,
+    run_turn,
+)
 from .state import (
+    ChatTurn,
+    Conversation,
     ConversationManager,
     Proposal,
     ProposalStatus,
+    ToolCallRecord,
     get_chat_state,
 )
-from .client import ChatClient, get_chat_client
 
 __all__ = [
-    "ConversationManager", "Proposal", "ProposalStatus",
-    "get_chat_state", "ChatClient", "get_chat_client",
+    "ChatClient", "ChatTurnResult", "get_chat_client", "is_available", "run_turn",
+    "ChatTurn", "Conversation", "ConversationManager",
+    "Proposal", "ProposalStatus", "ToolCallRecord",
+    "get_chat_state",
 ]

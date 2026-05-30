@@ -15,6 +15,7 @@ import asyncio
 import logging
 from typing import Literal
 
+from src.chat.client import is_available as chat_is_available
 from src.chat.state import get_chat_state
 from src.config import config
 from src.live import get_orchestrator
@@ -92,7 +93,7 @@ class TunerOrchestrator:
                 run.proposal_ids = proposal_ids
 
                 # ── 3. Optional Claude-Summary über alle Instrumente ─────
-                if use_claude and config.anthropic_api_key and proposal_ids:
+                if use_claude and await chat_is_available() and proposal_ids:
                     try:
                         run.claude_summary = await self._claude_summary(run)
                     except Exception as e:
@@ -160,8 +161,13 @@ class TunerOrchestrator:
             "sweep_lookback": winner["sweep_lookback"],
         }
 
-        if use_claude and config.anthropic_api_key:
-            rationale = await self._claude_rationale(winner, candidates, run)
+        if use_claude and await chat_is_available():
+            try:
+                rationale = await self._claude_rationale(winner, candidates, run)
+            except Exception as e:
+                log.warning("TunerRun %s: Claude-Rationale gescheitert (%s) → Template-Fallback",
+                            run.id, e)
+                rationale = _template_rationale(winner, candidates, run)
         else:
             rationale = _template_rationale(winner, candidates, run)
 
@@ -178,10 +184,10 @@ class TunerOrchestrator:
         candidates: list[dict],
         run: TunerRun,
     ) -> str:
-        """Bittet Claude (Opus 4.7) um eine konkrete Begründung für den Proposal."""
-        from src.chat.client import get_chat_client
+        """Bittet Claude (Opus, falls verfügbar) um eine konkrete Begründung.
 
-        client = get_chat_client()
+        Nutzt die Agent SDK direkt (kein MCP-Tool-Loop nötig — reines Reasoning).
+        """
         prompt = (
             f"Tuner-Lauf {run.id}: Grid-Search über rr_threshold × sweep_lookback "
             f"auf {len(run.instruments)} Instrumenten ({', '.join(run.instruments)}).\n\n"
@@ -198,21 +204,14 @@ class TunerOrchestrator:
             )
             + "\n\nSchreibe eine knappe Begründung (max 4 Sätze) für den Proposal — "
             "warum diese Combo besser sein könnte, welche Risiken (z.B. Overfitting bei kleinem N), "
-            "ob die Verbesserung statistisch belastbar ist."
+            "ob die Verbesserung statistisch belastbar ist. Antworte direkt auf Deutsch, "
+            "ohne Höflichkeitsfloskeln. Keine Tools nutzen."
         )
-
-        result = await client.run_turn(
-            messages=[{"role": "user", "content": prompt}],
-            model=config.chat_heavy_model,  # claude-opus-4-7
-        )
-        return f"[Tuner {run.id}, {config.chat_heavy_model}]\n{result.text}"
+        text = await _agent_sdk_text(prompt, model="opus")
+        return f"[Tuner {run.id}, Agent-SDK/opus]\n{text}"
 
     async def _claude_summary(self, run: TunerRun) -> str:
-        """Optional: hoch-level Summary über den ganzen Lauf (für UI-Anzeige)."""
-        from src.chat.client import get_chat_client
-
-        client = get_chat_client()
-        # Bauen wir uns einen kompakten Status-Block
+        """Hoch-level Summary über den ganzen Lauf — Agent-SDK-Text-Generation."""
         rows = []
         for inst, grid in run.results.items():
             if "error" in grid:
@@ -232,13 +231,10 @@ class TunerOrchestrator:
             + "\n".join(rows) + "\n\n"
             + f"Es wurden {len(run.proposal_ids)} Proposal(s) erzeugt.\n\n"
             "Fasse in 3 Sätzen zusammen: Welche Trends siehst du? Sind die Verbesserungen "
-            "groß genug um sie ernst zu nehmen? Was würdest du dem User empfehlen?"
+            "groß genug um sie ernst zu nehmen? Was würdest du dem User empfehlen? "
+            "Antworte direkt auf Deutsch, ohne Tools."
         )
-        result = await client.run_turn(
-            messages=[{"role": "user", "content": prompt}],
-            model=config.chat_heavy_model,
-        )
-        return result.text
+        return await _agent_sdk_text(prompt, model="opus")
 
 
 def _template_rationale(winner: dict, candidates: list[dict], run: TunerRun) -> str:
@@ -274,6 +270,35 @@ def _template_rationale(winner: dict, candidates: list[dict], run: TunerRun) -> 
 def _now_iso_str() -> str:
     from datetime import datetime, timezone
     return datetime.now(timezone.utc).isoformat()
+
+
+async def _agent_sdk_text(prompt: str, *, model: str | None = None) -> str:
+    """Reines Text-Generation via Agent SDK — keine Tools, kein MCP-Server.
+
+    Wird für Tuner-Rationale + Summary benutzt. Kein system_prompt → der CLI
+    nutzt sein Default-Verhalten (was für reine Text-Gen ausreicht).
+    """
+    from claude_agent_sdk import (
+        AssistantMessage, ClaudeAgentOptions, ResultMessage, TextBlock, query,
+    )
+
+    options = ClaudeAgentOptions(
+        # Keine Builtin-Tools, keine MCP-Tools, kein Permission-Loop
+        tools=[],
+        allowed_tools=[],
+        permission_mode="bypassPermissions",
+        max_turns=1,  # einzelne Text-Antwort, kein Tool-Loop
+        model=model,
+    )
+    parts: list[str] = []
+    async for msg in query(prompt=prompt, options=options):
+        if isinstance(msg, AssistantMessage):
+            for block in msg.content:
+                if isinstance(block, TextBlock):
+                    parts.append(block.text)
+        elif isinstance(msg, ResultMessage):
+            pass  # Result-Info verwerfen — wir wollen nur den Text
+    return "\n".join(parts).strip() or "(keine Antwort)"
 
 
 # ── Singleton ───────────────────────────────────────────────────────────

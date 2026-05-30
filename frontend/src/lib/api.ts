@@ -222,42 +222,42 @@ export async function resetBot(): Promise<BotState> {
 
 // ─── Chat ──────────────────────────────────────────────────────────────
 
-export type ChatModel = "claude-sonnet-4-6" | "claude-opus-4-7" | "claude-haiku-4-5-20251001";
+export type ChatModel = "sonnet" | "opus" | "haiku";
 
 export interface ToolCall {
   name: string;
   input: Record<string, unknown>;
   output: string;
-  iteration: number;
+}
+
+export interface ChatTurn {
+  role: "user" | "assistant";
+  text: string;
+  timestamp: string;
+  tool_calls: ToolCall[];
 }
 
 export interface ChatMessageResponse {
   conversation_id: string;
   reply: string;
   tool_calls: ToolCall[];
-  iterations: number;
-  model_used: string;
-  usage: {
-    input_tokens: number;
-    output_tokens: number;
-    cache_creation_input_tokens: number;
-    cache_read_input_tokens: number;
-  };
+  num_turns: number;
+  model_used: string | null;
+  cost_usd: number | null;
+  duration_ms: number | null;
 }
 
 export interface ConversationSummary {
   id: string;
   created_at: string;
   title: string;
-  n_messages: number;
-  model: string;
+  n_turns: number;
+  model: string | null;
+  session_id: string | null;
 }
 
 export interface ConversationDetail extends ConversationSummary {
-  messages: Array<{
-    role: "user" | "assistant";
-    content: string | Array<Record<string, unknown>>;
-  }>;
+  turns: ChatTurn[];
 }
 
 export interface Proposal {

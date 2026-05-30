@@ -97,7 +97,7 @@ class ConfigResponse(BaseModel):
     sessions: dict[str, str]
     capital_demo: bool
     broker_configured: bool
-    chat_configured: bool
+    chat_backend: str  # 'agent-sdk' wenn `claude` CLI da, sonst 'unavailable'
 
 
 class Candle(BaseModel):
@@ -168,6 +168,7 @@ def health() -> HealthResponse:
 @app.get("/config", response_model=ConfigResponse)
 def get_config() -> ConfigResponse:
     """Aktuelle Playbook-Konfiguration. Read-only in Etappe 0 — schreibbar später."""
+    import shutil
     return ConfigResponse(
         instruments=config.instruments,
         htf_liquidity=config.htf_liquidity,
@@ -183,7 +184,7 @@ def get_config() -> ConfigResponse:
         },
         capital_demo=config.is_demo,
         broker_configured=config.broker_configured,
-        chat_configured=bool(config.anthropic_api_key),
+        chat_backend="agent-sdk" if shutil.which("claude") else "unavailable",
     )
 
 
@@ -728,35 +729,43 @@ class ChatMessageRequest(BaseModel):
                                          description="None → neue Konversation wird erzeugt")
     message: str = Field(min_length=1, max_length=8000)
     model: str | None = Field(default=None,
-                               description="claude-sonnet-4-6 (Default) | claude-opus-4-7 | claude-haiku-4-5-20251001")
+                               description="sonnet | opus | haiku (None = Claude-Code Default)")
 
 
 class ToolCallOut(BaseModel):
     name: str
     input: dict
     output: str
-    iteration: int
 
 
 class ChatMessageResponse(BaseModel):
     conversation_id: str
     reply: str
     tool_calls: list[ToolCallOut]
-    iterations: int
-    model_used: str
-    usage: dict[str, int]
+    num_turns: int
+    model_used: str | None
+    cost_usd: float | None
+    duration_ms: int | None
+
+
+class ChatTurnOut(BaseModel):
+    role: str
+    text: str
+    timestamp: str
+    tool_calls: list[ToolCallOut]
 
 
 class ConversationOut(BaseModel):
     id: str
     created_at: str
     title: str
-    n_messages: int
-    model: str
+    n_turns: int
+    model: str | None
+    session_id: str | None
 
 
 class ConversationDetailOut(ConversationOut):
-    messages: list[dict]
+    turns: list[ChatTurnOut]
 
 
 class ProposalOut(BaseModel):
@@ -772,48 +781,68 @@ class ProposalOut(BaseModel):
 
 @app.post("/chat/message", response_model=ChatMessageResponse)
 async def chat_message(req: ChatMessageRequest) -> ChatMessageResponse:
-    """Eine User-Message an Claude senden. Erzeugt neue Konversation wenn keine angegeben."""
-    if not config.anthropic_api_key:
-        raise HTTPException(503, "ANTHROPIC_API_KEY nicht gesetzt — Chat deaktiviert")
+    """Eine User-Message via Claude Agent SDK senden.
+
+    Erzeugt neue Konversation wenn keine angegeben. Nutzt die Claude-Code-CLI
+    des Users (subscription-based, KEIN ANTHROPIC_API_KEY).
+    """
+    from src.chat import ChatTurn, ToolCallRecord, is_available
+
+    if not await is_available():
+        raise HTTPException(
+            503,
+            "Claude-Code-CLI nicht gefunden (`claude` nicht im PATH). "
+            "Install: https://docs.claude.com/en/docs/claude-code/installation",
+        )
 
     state = get_chat_state()
     client = get_chat_client()
 
     conv = state.get(req.conversation_id) if req.conversation_id else None
     if conv is None:
-        conv = state.new_conversation(model=req.model or "claude-sonnet-4-6")
+        conv = state.new_conversation(model=req.model)
 
-    new_user_msg = {"role": "user", "content": req.message}
-    full_messages = conv.messages + [new_user_msg]
+    # User-Turn anhängen + persistieren
+    user_turn = ChatTurn(role="user", text=req.message)
+    state.append_turn(conv.id, user_turn)
+
+    # Erste User-Frage wird Titel
+    if len(conv.turns) == 1:
+        title = req.message.strip().split("\n")[0][:60]
+        state.update_title(conv.id, title)
 
     try:
         result = await client.run_turn(
-            messages=full_messages,
-            model=req.model or conv.model,
+            user_message=req.message,
             conversation_id=conv.id,
+            session_id=conv.session_id,
+            model=req.model or conv.model,
         )
     except Exception as e:
         logging.getLogger(__name__).exception("chat-call gescheitert: %s", e)
         raise HTTPException(500, f"Chat-Call gescheitert: {type(e).__name__}: {e}")
 
-    # User-Message + alle vom Loop erzeugten Messages persistieren
-    state.append_messages(conv.id, [new_user_msg, *result.new_messages])
-
-    # Erste User-Frage wird Titel (kurz halten)
-    if len(conv.messages) == 0:
-        title = req.message.strip().split("\n")[0][:60]
-        state.update_title(conv.id, title)
+    # Assistant-Turn persistieren + session_id für Resumption merken
+    assistant_turn = ChatTurn(
+        role="assistant",
+        text=result.text,
+        tool_calls=list(result.tool_calls),
+    )
+    state.append_turn(conv.id, assistant_turn)
+    if result.session_id:
+        state.update_session_id(conv.id, result.session_id)
 
     return ChatMessageResponse(
         conversation_id=conv.id,
         reply=result.text,
         tool_calls=[
-            ToolCallOut(name=t.name, input=t.input, output=t.output, iteration=t.iteration)
+            ToolCallOut(name=t.name, input=t.input, output=t.output)
             for t in result.tool_calls
         ],
-        iterations=result.iterations,
+        num_turns=result.num_turns,
         model_used=result.model_used,
-        usage=result.usage,
+        cost_usd=result.cost_usd,
+        duration_ms=result.duration_ms,
     )
 
 
@@ -823,7 +852,7 @@ def chat_list() -> list[ConversationOut]:
     return [
         ConversationOut(
             id=c.id, created_at=c.created_at, title=c.title,
-            n_messages=len(c.messages), model=c.model,
+            n_turns=len(c.turns), model=c.model, session_id=c.session_id,
         )
         for c in state.list_conversations()
     ]
@@ -837,7 +866,17 @@ def chat_get(conv_id: str) -> ConversationDetailOut:
         raise HTTPException(404, f"Konversation {conv_id} nicht gefunden")
     return ConversationDetailOut(
         id=conv.id, created_at=conv.created_at, title=conv.title,
-        n_messages=len(conv.messages), model=conv.model, messages=conv.messages,
+        n_turns=len(conv.turns), model=conv.model, session_id=conv.session_id,
+        turns=[
+            ChatTurnOut(
+                role=t.role, text=t.text, timestamp=t.timestamp,
+                tool_calls=[
+                    ToolCallOut(name=tc.name, input=tc.input, output=tc.output)
+                    for tc in t.tool_calls
+                ],
+            )
+            for t in conv.turns
+        ],
     )
 
 

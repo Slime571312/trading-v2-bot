@@ -1,11 +1,12 @@
 """Conversation-History + Proposal-Queue, persistent als JSON.
 
-Eine Konversation: ID + Liste der raw-message-dicts (genau das Format das die
-Anthropic-API frisst). Mehrere Konversationen parallel möglich (frontend ruft
-auf, welche aktiv ist).
+Schema-Vereinfachung mit Agent-SDK: statt roher Anthropic-Content-Blocks
+speichern wir nur eine UI-freundliche Liste aus ChatTurn-Objekten + die
+Claude-Code-`session_id` für Session-Resumption. Der eigentliche Conversation-
+Context lebt in Claude Codes Session-Store.
 
 Proposals: `propose_config_diff` legt einen Eintrag an. Der User entscheidet
-über `/chat/proposals/{id}/apply|reject` — nur dort wird BotState mutiert.
+über `/chat/proposals/{id}/apply|reject`.
 """
 from __future__ import annotations
 
@@ -57,29 +58,68 @@ class Proposal:
 
 
 @dataclass(slots=True)
+class ToolCallRecord:
+    """Eine Tool-Invocation in einem Turn — Display-only."""
+    name: str  # ohne mcp__-Präfix (kompakter im UI)
+    input: dict[str, Any]
+    output: str  # JSON-String oder Plaintext
+
+
+@dataclass(slots=True)
+class ChatTurn:
+    role: Literal["user", "assistant"]
+    text: str  # finale Antwort (assistant) bzw. User-Eingabe
+    timestamp: str = field(default_factory=_now_iso)
+    tool_calls: list[ToolCallRecord] = field(default_factory=list)
+
+    def to_json(self) -> dict:
+        return {
+            "role": self.role,
+            "text": self.text,
+            "timestamp": self.timestamp,
+            "tool_calls": [asdict(tc) for tc in self.tool_calls],
+        }
+
+    @classmethod
+    def from_json(cls, d: dict) -> "ChatTurn":
+        return cls(
+            role=d["role"],
+            text=d.get("text", ""),
+            timestamp=d.get("timestamp", _now_iso()),
+            tool_calls=[ToolCallRecord(**tc) for tc in d.get("tool_calls", [])],
+        )
+
+
+@dataclass(slots=True)
 class Conversation:
     id: str
     created_at: str
     title: str
-    messages: list[dict] = field(default_factory=list)
-    model: str = "claude-sonnet-4-6"
+    turns: list[ChatTurn] = field(default_factory=list)
+    model: str | None = None  # None = Claude Code default
+    session_id: str | None = None  # Claude-Code-Session zum resumen
 
     def to_json(self) -> dict:
         return {
             "id": self.id,
             "created_at": self.created_at,
             "title": self.title,
-            "messages": self.messages,
+            "turns": [t.to_json() for t in self.turns],
             "model": self.model,
+            "session_id": self.session_id,
         }
 
     @classmethod
     def from_json(cls, d: dict) -> "Conversation":
+        # Backward-compat: alte Konversationen hatten `messages` (Anthropic-Format).
+        # Die werfen wir weg — sie sind mit dem neuen Schema inkompatibel.
+        turns_json = d.get("turns", [])
         return cls(
             id=d["id"], created_at=d["created_at"],
             title=d.get("title", "Neue Konversation"),
-            messages=d.get("messages", []),
-            model=d.get("model", "claude-sonnet-4-6"),
+            turns=[ChatTurn.from_json(t) for t in turns_json],
+            model=d.get("model"),
+            session_id=d.get("session_id"),
         )
 
 
@@ -96,15 +136,17 @@ class ChatState:
 
     @classmethod
     def from_json(cls, d: dict) -> "ChatState":
-        return cls(
-            conversations={
-                k: Conversation.from_json(v) for k, v in d.get("conversations", {}).items()
-            },
-            proposals=[Proposal.from_json(p) for p in d.get("proposals", [])],
-        )
+        out = cls()
+        for k, v in d.get("conversations", {}).items():
+            try:
+                out.conversations[k] = Conversation.from_json(v)
+            except (KeyError, TypeError) as e:
+                log.warning("Conversation %s übersprungen (alt/inkompatibel): %s", k, e)
+        out.proposals = [Proposal.from_json(p) for p in d.get("proposals", [])]
+        return out
 
 
-# ── Persistenz (atomar, gleicher Pattern wie live/state.py) ─────────────
+# ── Persistenz (atomar) ─────────────────────────────────────────────────
 
 
 def _load() -> ChatState:
@@ -113,7 +155,7 @@ def _load() -> ChatState:
     try:
         with CHAT_FILE.open("r", encoding="utf-8") as f:
             return ChatState.from_json(json.load(f))
-    except (json.JSONDecodeError, KeyError, ValueError) as e:
+    except (json.JSONDecodeError, ValueError) as e:
         log.error("Chat-State korrupt (%s) — starte leer", e)
         return ChatState()
 
@@ -134,12 +176,10 @@ def _save(state: ChatState) -> None:
                 pass
 
 
-# ── Manager-Schicht ─────────────────────────────────────────────────────
+# ── Manager-Singleton ───────────────────────────────────────────────────
 
 
 class ConversationManager:
-    """Singleton-Manager. Hält in-Memory State, persistiert bei jeder Mutation."""
-
     def __init__(self) -> None:
         self._state: ChatState = _load()
 
@@ -151,7 +191,7 @@ class ConversationManager:
     def get(self, conv_id: str) -> Conversation | None:
         return self._state.conversations.get(conv_id)
 
-    def new_conversation(self, model: str = "claude-sonnet-4-6", title: str | None = None) -> Conversation:
+    def new_conversation(self, model: str | None = None, title: str | None = None) -> Conversation:
         conv = Conversation(
             id=_new_id("c_"),
             created_at=_now_iso(),
@@ -162,19 +202,18 @@ class ConversationManager:
         _save(self._state)
         return conv
 
-    def append_messages(self, conv_id: str, new_messages: list[dict]) -> None:
+    def append_turn(self, conv_id: str, turn: ChatTurn) -> None:
         conv = self._state.conversations.get(conv_id)
         if not conv:
             raise KeyError(f"Conversation {conv_id} nicht gefunden")
-        conv.messages.extend(new_messages)
+        conv.turns.append(turn)
         _save(self._state)
 
-    def set_messages(self, conv_id: str, messages: list[dict]) -> None:
+    def update_session_id(self, conv_id: str, session_id: str) -> None:
         conv = self._state.conversations.get(conv_id)
-        if not conv:
-            raise KeyError(f"Conversation {conv_id} nicht gefunden")
-        conv.messages = messages
-        _save(self._state)
+        if conv and session_id and conv.session_id != session_id:
+            conv.session_id = session_id
+            _save(self._state)
 
     def update_title(self, conv_id: str, title: str) -> None:
         conv = self._state.conversations.get(conv_id)
@@ -231,7 +270,6 @@ _singleton: ConversationManager | None = None
 
 
 def get_chat_state() -> ConversationManager:
-    """Lazy-Singleton. FastAPI-Lifespan instanziiert beim Startup."""
     global _singleton
     if _singleton is None:
         _singleton = ConversationManager()
