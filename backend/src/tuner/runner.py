@@ -59,7 +59,7 @@ class TunerOrchestrator:
         """
         async with self._lock:
             orch = get_orchestrator()
-            instruments = instruments or list(orch.state.instruments)
+            instruments = instruments or orch.state.list_instruments()
             run = new_run(instruments, iter_tf, bars, triggered_by)
             self._current = run
             self.history.runs.append(run)
@@ -70,22 +70,23 @@ class TunerOrchestrator:
 
             try:
                 # ── 1. Grid-Search pro Instrument ────────────────────────
-                for inst in instruments:
-                    log.info("TunerRun %s: Grid-Search %s", run.id, inst)
+                for inst_name in instruments:
+                    log.info("TunerRun %s: Grid-Search %s", run.id, inst_name)
+                    bot_inst = orch.state.ensure(inst_name)
                     grid = await run_grid_search(
-                        instrument=inst,
+                        instrument=inst_name,
                         iter_tf=iter_tf,
                         bars=bars,
-                        current_rr_threshold=orch.state.rr_threshold,
-                        current_sweep_lookback=orch.state.sweep_lookback,
-                        risk_pct=orch.state.risk_pct,
-                        initial_capital=orch.state.initial_capital,
+                        current_rr_threshold=bot_inst.rr_threshold,
+                        current_sweep_lookback=bot_inst.sweep_lookback,
+                        risk_pct=bot_inst.risk_pct,
+                        initial_capital=bot_inst.initial_capital,
                     )
                     if grid is None:
-                        log.warning("TunerRun %s: %s übersprungen (keine Daten)", run.id, inst)
-                        run.results[inst] = {"error": "keine Daten"}
+                        log.warning("TunerRun %s: %s übersprungen (keine Daten)", run.id, inst_name)
+                        run.results[inst_name] = {"error": "keine Daten"}
                         continue
-                    run.results[inst] = grid.to_json()
+                    run.results[inst_name] = grid.to_json()
                     save_history(self.history)  # incrementally persist
 
                 # ── 2. Proposals erzeugen (über Improvement-Threshold) ───

@@ -1,30 +1,31 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import type { BotState } from "./api";
+import type { BotInstance } from "./api";
 
 export type LiveMessage =
   | { type: "ping" }
-  | { type: "state"; state: BotState }
-  | { type: "trade_opened"; trade: BotState["open_trades"][number] }
-  | { type: "trade_closed"; trade: BotState["closed_trades"][number] }
-  | { type: "error"; message: string };
+  | { type: "snapshot"; instances: Record<string, BotInstance> }
+  | { type: "instance_update"; instrument: string; instance: BotInstance }
+  | { type: "trade_opened"; instrument: string; trade: BotInstance["open_trades"][number] }
+  | { type: "trade_closed"; instrument: string; trade: BotInstance["closed_trades"][number] }
+  | { type: "error"; instrument?: string; message: string };
 
 export type ConnStatus = "connecting" | "open" | "closed" | "error";
 
 interface UseLiveFeedResult {
-  state: BotState | null;
+  instances: Record<string, BotInstance>;
   lastEvent: LiveMessage | null;
   status: ConnStatus;
   reconnectAttempt: number;
 }
 
 /**
- * WebSocket-Hook für /ws/live mit Exponential-Backoff-Reconnect.
- * Verarbeitet ping → pong und parsed alle JSON-Events.
+ * Multi-Bot-WS-Hook: hält das aktuelle Instances-Mapping, das vom Server
+ * gepusht wird. Initial-Snapshot beim Connect, dann incremental updates.
  */
 export function useLiveFeed(): UseLiveFeedResult {
-  const [state, setState] = useState<BotState | null>(null);
+  const [instances, setInstances] = useState<Record<string, BotInstance>>({});
   const [lastEvent, setLastEvent] = useState<LiveMessage | null>(null);
   const [status, setStatus] = useState<ConnStatus>("connecting");
   const [reconnectAttempt, setReconnectAttempt] = useState(0);
@@ -37,7 +38,6 @@ export function useLiveFeed(): UseLiveFeedResult {
 
     function connect() {
       if (unmounted) return;
-      // Direkte WS-URL ohne den Next.js-Rewrite-Proxy (rewrites unterstützen kein WS).
       const url = `ws://${window.location.hostname}:8000/ws/live`;
       setStatus("connecting");
       try {
@@ -55,15 +55,16 @@ export function useLiveFeed(): UseLiveFeedResult {
           if (unmounted) return;
           try {
             const msg = JSON.parse(e.data) as LiveMessage;
-            if (msg.type === "ping") {
-              ws.send("pong");
-              return;
-            }
+            if (msg.type === "ping") { ws.send("pong"); return; }
+
             setLastEvent(msg);
-            if (msg.type === "state") setState(msg.state);
-            else if (msg.type === "trade_opened" || msg.type === "trade_closed") {
-              // Re-fetch full state to stay in sync
-              setState((prev) => prev);
+
+            if (msg.type === "snapshot") {
+              setInstances(msg.instances);
+            } else if (msg.type === "instance_update") {
+              setInstances((prev) => ({ ...prev, [msg.instrument]: msg.instance }));
+            } else if (msg.type === "trade_opened" || msg.type === "trade_closed") {
+              // Instance-Update kommt separat; nichts zu tun hier
             }
           } catch (err) {
             console.warn("ws msg parse failed", err);
@@ -82,7 +83,7 @@ export function useLiveFeed(): UseLiveFeedResult {
           const delay = Math.min(30_000, 1_000 * Math.pow(1.5, attempt));
           reconnectTimer.current = setTimeout(connect, delay);
         };
-      } catch (err) {
+      } catch {
         setStatus("error");
         attempt += 1;
         const delay = Math.min(30_000, 1_000 * Math.pow(1.5, attempt));
@@ -102,5 +103,5 @@ export function useLiveFeed(): UseLiveFeedResult {
     };
   }, []);
 
-  return { state, lastEvent, status, reconnectAttempt };
+  return { instances, lastEvent, status, reconnectAttempt };
 }

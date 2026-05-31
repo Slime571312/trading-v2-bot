@@ -1,20 +1,13 @@
-"""Live-Paper-Bot — asyncio Tick-Loop ruft Strategy-Core, persistiert State.
-
-Spec: Trading/Bot/Architektur-v2.md (Etappe 5) + Trading/Bot/Execution.md.
-
-**Pragmatische Architektur-Wahl:** REST-Polling alle 60s statt Capital-WebSocket.
-Begründung:
-- 5m-Strategie braucht keine Sub-Sekunden-Latenz
-- Cache-TTLs (60s für 1m, 300s für 5m) sind natürlicher Tick-Rhythmus
-- WS-Reconnect-Logik (Spec aus Execution.md) bleibt für Etappe 7-Refinement
-
-Der **Frontend-Push** (FastAPI-WebSocket → Browser) ist Pflicht und gebaut.
-"""
-from .state import BotState, OpenTrade, ClosedTrade, load_state, save_state
+"""Live Multi-Paper-Bot — n Instanzen (1 pro Instrument), je eigene Task/State."""
 from .orchestrator import BotOrchestrator, get_orchestrator
+from .state import (
+    BotInstance, BotState, ClosedTrade, DEFAULT_INSTRUMENTS,
+    OpenTrade, TickLogEntry, load_state, save_state,
+)
 
 __all__ = [
-    "BotState", "OpenTrade", "ClosedTrade",
+    "BotInstance", "BotState", "DEFAULT_INSTRUMENTS",
+    "OpenTrade", "ClosedTrade", "TickLogEntry",
     "load_state", "save_state",
     "BotOrchestrator", "get_orchestrator",
 ]

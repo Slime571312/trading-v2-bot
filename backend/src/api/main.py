@@ -25,7 +25,8 @@ from src.brokers.capital_com import CapitalAPIError, CapitalAuthError
 from src.chat import get_chat_client, get_chat_state
 from src.config import EPIC_MAP, RESOLUTION_MAP, config
 from src.data.fetcher import load_candles
-from src.live import get_orchestrator
+from src.data.signal_cache import get_signal_cache
+from src.live import DEFAULT_INSTRUMENTS, get_orchestrator
 from src.live.orchestrator import shutdown_orchestrator
 from src.tuner import get_tuner
 from src.strategy_core import evaluate as evaluate_signal
@@ -41,18 +42,23 @@ logging.basicConfig(level=config.log_level.upper())
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """FastAPI-Lifecycle. Lädt persistierten Bot-State beim Start, stoppt sauber."""
+    """FastAPI-Lifecycle. Lädt Bot-State + startet SignalCache-Background-Task."""
     orch = get_orchestrator()
-    log = logging.getLogger("trading-v2")
-    log.info(
-        "Bot-Orchestrator initialisiert: open_trades=%d, closed_trades=%d, equity=%.2f",
-        len(orch.state.open_trades),
-        len(orch.state.closed_trades),
-        orch.state.equity,
+    cache = get_signal_cache()
+    log_app = logging.getLogger("trading-v2")
+    n_inst = len(orch.state.instances)
+    total_open = sum(len(i.open_trades) for i in orch.state.instances.values())
+    total_closed = sum(len(i.closed_trades) for i in orch.state.instances.values())
+    log_app.info(
+        "Bot-Orchestrator initialisiert: %d Instanzen, open=%d, closed=%d",
+        n_inst, total_open, total_closed,
     )
+    await cache.start(instruments=DEFAULT_INSTRUMENTS, refresh_interval_s=60)
+    log_app.info("SignalCache Background-Task gestartet")
     yield
+    await cache.stop()
     await shutdown_orchestrator()
-    log.info("Backend-Shutdown — Bot gestoppt, State persistiert")
+    log_app.info("Backend-Shutdown — Bot + Cache gestoppt, State persistiert")
 
 
 app = FastAPI(
@@ -124,11 +130,14 @@ Timeframe = Literal["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
 
 
 class SignalResponse(BaseModel):
-    """Signal aus dem Strategy-Core. Bei `side='none'` ist kein Setup aktiv."""
+    """Signal aus dem Cache. Bei `side='none'` ist kein Setup aktiv,
+    bei `side='error'` ist die Auswertung gecrasht (siehe `error`-Feld)."""
 
     instrument: str
-    side: Literal["long", "short", "none"]
-    bias_direction: Literal["long", "short", "neutral"]
+    epic: str | None = None
+    refreshed_at: str | None = None
+    side: Literal["long", "short", "none", "error"]
+    bias_direction: Literal["long", "short", "neutral"] = "neutral"
     bias_bos_time: str | None = None
     bias_bos_level: float | None = None
     variant: Literal["primary", "ob_retest", "fvg_retest", "ultimate"] | None = None
@@ -138,15 +147,12 @@ class SignalResponse(BaseModel):
     rr: float | None = None
     htf_used: str | None = None
     ltf_used: str | None = None
-    sweep_time: str | None = None
-    sweep_level: float | None = None
-    sweep_direction: Literal["bsl", "ssl"] | None = None
-    bos_time: str | None = None
-    bos_level: float | None = None
-    eq_level: float | None = None
     has_ob: bool = False
     has_fvg: bool = False
-    reason: str
+    reason: str = ""
+    error: str | None = None
+
+    model_config = {"extra": "ignore"}  # ignoriere unbekannte Cache-Felder
 
 
 # ─── Routes ──────────────────────────────────────────────────────────────
@@ -158,9 +164,9 @@ def health() -> HealthResponse:
     orch = get_orchestrator()
     return HealthResponse(
         status="ok",
-        version="0.2.0",
+        version="0.3.0",
         timestamp_utc=datetime.now(timezone.utc).isoformat(),
-        bot_running=orch.is_running(),
+        bot_running=orch.any_running(),
         broker_connected=config.broker_configured,
     )
 
@@ -227,79 +233,36 @@ async def get_candles(
 
 
 @app.get("/signal/{instrument}", response_model=SignalResponse)
-async def get_signal(
-    instrument: InstrumentName,
-    sweep_lookback: int = Query(default=10, ge=3, le=100,
-                                 description="Wie viele HTF-Bars zurück nach Sweeps suchen"),
-    rr_threshold: float = Query(default=2.0, ge=1.0, le=5.0,
-                                description="RR-Schwelle für Direct-Entry"),
-) -> SignalResponse:
-    """Vollständige Playbook-Auswertung — holt alle TFs und ruft engine.evaluate.
+async def get_signal(instrument: InstrumentName) -> SignalResponse:
+    """Cached Signal-Auswertung — antwortet aus dem SignalCache (instant).
 
-    Liefert immer eine Response (auch wenn kein Signal aktiv ist) inkl. `bias_direction`
-    und `reason`, damit das Dashboard auch im 'kein Setup'-Fall sinnvoll anzeigen kann.
+    Der Cache refresht im Hintergrund alle 60s. Beim ersten Call vor dem
+    initialen Refresh wartet wir kurz auf den Cache (max 5s).
     """
-    tfs_needed = ["1d", "1h", "30m", "15m", "5m", "1m"]
-    bars: dict[str, "pd.DataFrame"] = {}
-    failed_tfs: list[str] = []
-    for tf in tfs_needed:
-        try:
-            df = await load_candles(instrument, tf, bars=200)
-            if not df.empty:
-                bars[tf] = df
-        except (CapitalAuthError, CapitalAPIError) as e:
-            failed_tfs.append(f"{tf}({type(e).__name__})")
+    cache = get_signal_cache()
+    if not cache.get(instrument):
+        await cache.wait_initial(timeout=5.0)
+    cached = cache.get(instrument)
+    if not cached:
+        raise HTTPException(503, f"Signal für {instrument} noch nicht im Cache")
+    return SignalResponse(**cached.to_json())
 
-    if "1d" not in bars:
-        raise HTTPException(status_code=503,
-                            detail=f"Daily-Daten fehlen für {instrument}; failed: {failed_tfs}")
 
-    daily_bias = compute_bias(bars["1d"])
-    signal = evaluate_signal(
-        instrument, bars,
-        rr_threshold=rr_threshold,
-        sweep_lookback_bars=sweep_lookback,
-    )
+@app.get("/signals", response_model=list[SignalResponse])
+async def get_signals_batch() -> list[SignalResponse]:
+    """Batch-Endpoint: alle Signals in einem Call (für Dashboard-Cards)."""
+    cache = get_signal_cache()
+    if not cache.get_all():
+        await cache.wait_initial(timeout=5.0)
+    return [SignalResponse(**c.to_json()) for c in cache.get_all()]
 
-    if signal is not None:
-        return SignalResponse(
-            instrument=instrument,
-            side=signal.side,
-            bias_direction=signal.bias.direction,
-            bias_bos_time=signal.bias.last_bos_time.isoformat() if signal.bias.last_bos_time else None,
-            bias_bos_level=signal.bias.last_bos_level,
-            variant=signal.variant,
-            entry=signal.entry,
-            sl=signal.sl,
-            tp=signal.tp,
-            rr=round(signal.rr, 3),
-            htf_used=signal.htf_used,
-            ltf_used=signal.ltf_used,
-            sweep_time=signal.sweep.time.isoformat(),
-            sweep_level=signal.sweep.level,
-            sweep_direction=signal.sweep.direction,
-            bos_time=signal.structure_break.time.isoformat(),
-            bos_level=signal.structure_break.broken_swing.price,
-            eq_level=signal.equilibrium.eq if signal.equilibrium else None,
-            has_ob=signal.ob is not None,
-            has_fvg=signal.fvg is not None,
-            reason=f"setup found: {signal.variant} ({signal.htf_used}-sweep → {signal.ltf_used}-bos)",
-        )
 
-    # Kein Signal — erkläre warum
-    reasons = [f"daily bias: {daily_bias.direction}"]
-    if daily_bias.direction == "neutral":
-        reasons.append("kein Daily-BoS detektiert")
-    else:
-        reasons.append("kein gültiger HTF-Sweep + LTF-BOS im Lookback-Fenster")
-    return SignalResponse(
-        instrument=instrument,
-        side="none",
-        bias_direction=daily_bias.direction,
-        bias_bos_time=daily_bias.last_bos_time.isoformat() if daily_bias.last_bos_time else None,
-        bias_bos_level=daily_bias.last_bos_level,
-        reason=" · ".join(reasons),
-    )
+@app.post("/signals/refresh")
+async def refresh_signals(instrument: InstrumentName | None = None) -> dict:
+    """Triggert sofortigen Cache-Refresh (UI 'Refresh now' Button)."""
+    cache = get_signal_cache()
+    await cache.refresh_now(instrument=instrument)
+    return {"refreshed": instrument or "all", "n_cached": len(cache.get_all())}
 
 
 # ─── Backtest ────────────────────────────────────────────────────────────
@@ -633,20 +596,47 @@ async def diagnose(
     return result
 
 
-# ─── Live-Bot ────────────────────────────────────────────────────────────
+# ─── Multi-Bot — eine Instanz pro Instrument ─────────────────────────────
 
 
 class BotStartRequest(BaseModel):
     initial_capital: float | None = Field(default=None, ge=100.0)
     tick_interval_s: int | None = Field(default=None, ge=10, le=600)
-    instruments: list[InstrumentName] | None = None
     rr_threshold: float | None = Field(default=None, ge=1.0, le=5.0)
     risk_pct: float | None = Field(default=None, ge=0.001, le=0.05)
     sweep_lookback: int | None = Field(default=None, ge=3, le=50)
-    reset: bool = Field(default=False, description="Trades + Equity zurücksetzen vor Start")
+    reset: bool = Field(default=False)
 
 
-class BotStateResponse(BaseModel):
+class StartAllRequest(BaseModel):
+    instruments: list[InstrumentName] | None = Field(default=None,
+                                                      description="None → alle bekannten")
+    initial_capital: float | None = None
+    tick_interval_s: int | None = None
+    rr_threshold: float | None = None
+    risk_pct: float | None = None
+    sweep_lookback: int | None = None
+    reset: bool = False
+
+
+class TickLogOut(BaseModel):
+    timestamp: str
+    action: str
+    decision: str
+    bias: str | None = None
+    htf_used: str | None = None
+    ltf_used: str | None = None
+    sweep_time: str | None = None
+    sweep_direction: str | None = None
+    bos_time: str | None = None
+    rr_computed: float | None = None
+    variant: str | None = None
+    detail: str | None = None
+    related_trade_id: str | None = None
+
+
+class BotInstanceResponse(BaseModel):
+    instrument: str
     running: bool
     started_at: str | None
     stopped_at: str | None
@@ -655,69 +645,132 @@ class BotStateResponse(BaseModel):
     tick_interval_s: int
     initial_capital: float
     equity: float
-    instruments: list[str]
     open_trades: list[dict]
     closed_trades: list[dict]
     last_error: str | None
     rr_threshold: float
     risk_pct: float
     sweep_lookback: int
+    n_tick_log: int  # Anzahl ohne den ganzen Log zu senden
+
+
+def _instance_to_response(inst) -> BotInstanceResponse:
+    d = inst.to_json()
+    d.pop("tick_log", None)
+    d["n_tick_log"] = len(inst.tick_log)
+    return BotInstanceResponse(**d)
+
+
+class BotOverviewResponse(BaseModel):
+    instances: list[BotInstanceResponse]
+    total_equity: float
+    any_running: bool
     n_ws_clients: int
 
 
-def _state_to_response() -> BotStateResponse:
+@app.get("/bot/instances", response_model=BotOverviewResponse)
+def bot_instances() -> BotOverviewResponse:
+    """Alle Bot-Instanzen im Überblick."""
     orch = get_orchestrator()
-    d = orch.state.to_json()
-    d["n_ws_clients"] = ws_hub.n_clients()
-    return BotStateResponse(**d)
+    return BotOverviewResponse(
+        instances=[_instance_to_response(inst) for inst in orch.state.instances.values()],
+        total_equity=round(orch.state.total_equity(), 2),
+        any_running=orch.any_running(),
+        n_ws_clients=ws_hub.n_clients(),
+    )
 
 
-@app.get("/bot/state", response_model=BotStateResponse)
-def bot_state() -> BotStateResponse:
-    """Aktueller Bot-State — auch wenn der Bot nicht läuft."""
-    return _state_to_response()
-
-
-@app.post("/bot/start", response_model=BotStateResponse)
-async def bot_start(req: BotStartRequest) -> BotStateResponse:
-    """Startet den Tick-Loop. Idempotent: wenn er schon läuft, gibt aktuellen State."""
+@app.get("/bot/{instrument}", response_model=BotInstanceResponse)
+def bot_get(instrument: InstrumentName) -> BotInstanceResponse:
     orch = get_orchestrator()
-    await orch.start(
+    inst = orch.state.ensure(instrument)
+    return _instance_to_response(inst)
+
+
+@app.post("/bot/{instrument}/start", response_model=BotInstanceResponse)
+async def bot_start(instrument: InstrumentName, req: BotStartRequest) -> BotInstanceResponse:
+    orch = get_orchestrator()
+    inst = await orch.start(
+        instrument,
         initial_capital=req.initial_capital,
         tick_interval_s=req.tick_interval_s,
-        instruments=req.instruments,
         rr_threshold=req.rr_threshold,
         risk_pct=req.risk_pct,
         sweep_lookback=req.sweep_lookback,
         reset=req.reset,
     )
-    await ws_hub.push_to_dashboard({"type": "state", "state": orch.state.to_json()})
-    return _state_to_response()
+    await ws_hub.push_to_dashboard({
+        "type": "instance_update", "instrument": instrument,
+        "instance": inst.to_json(),
+    })
+    return _instance_to_response(inst)
 
 
-@app.post("/bot/stop", response_model=BotStateResponse)
-async def bot_stop() -> BotStateResponse:
-    """Stoppt den Tick-Loop. State (offene Trades, Equity) bleibt erhalten."""
+@app.post("/bot/{instrument}/stop", response_model=BotInstanceResponse)
+async def bot_stop(instrument: InstrumentName) -> BotInstanceResponse:
     orch = get_orchestrator()
-    await orch.stop()
-    await ws_hub.push_to_dashboard({"type": "state", "state": orch.state.to_json()})
-    return _state_to_response()
+    try:
+        inst = await orch.stop(instrument)
+    except KeyError as e:
+        raise HTTPException(404, str(e))
+    await ws_hub.push_to_dashboard({
+        "type": "instance_update", "instrument": instrument,
+        "instance": inst.to_json(),
+    })
+    return _instance_to_response(inst)
 
 
-@app.post("/bot/reset", response_model=BotStateResponse)
-async def bot_reset() -> BotStateResponse:
-    """Komplett-Reset: stoppt Bot, leert Trades, Equity = initial_capital."""
+@app.post("/bot/{instrument}/reset", response_model=BotInstanceResponse)
+async def bot_reset(instrument: InstrumentName) -> BotInstanceResponse:
     orch = get_orchestrator()
-    await orch.reset()
-    await ws_hub.push_to_dashboard({"type": "state", "state": orch.state.to_json()})
-    return _state_to_response()
+    inst = await orch.reset(instrument)
+    await ws_hub.push_to_dashboard({
+        "type": "instance_update", "instrument": instrument,
+        "instance": inst.to_json(),
+    })
+    return _instance_to_response(inst)
+
+
+@app.get("/bot/{instrument}/ticks", response_model=list[TickLogOut])
+def bot_ticks(instrument: InstrumentName, limit: int = Query(default=50, ge=1, le=200)) -> list[TickLogOut]:
+    """Tick-Log einer Instanz — neueste zuerst."""
+    orch = get_orchestrator()
+    inst = orch.state.ensure(instrument)
+    return [TickLogOut(**t.to_json()) for t in reversed(inst.tick_log[-limit:])]
+
+
+@app.post("/bot/start-all", response_model=BotOverviewResponse)
+async def bot_start_all(req: StartAllRequest) -> BotOverviewResponse:
+    orch = get_orchestrator()
+    targets = req.instruments or DEFAULT_INSTRUMENTS
+    for inst_name in targets:
+        await orch.start(
+            inst_name,
+            initial_capital=req.initial_capital,
+            tick_interval_s=req.tick_interval_s,
+            rr_threshold=req.rr_threshold,
+            risk_pct=req.risk_pct,
+            sweep_lookback=req.sweep_lookback,
+            reset=req.reset,
+        )
+    return bot_instances()
+
+
+@app.post("/bot/stop-all", response_model=BotOverviewResponse)
+async def bot_stop_all() -> BotOverviewResponse:
+    orch = get_orchestrator()
+    await orch.stop_all()
+    return bot_instances()
 
 
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket) -> None:
-    """WebSocket für Live-Updates — sendet zunächst kompletten State, dann Push pro Event."""
+    """WebSocket für Live-Updates — sendet initial alle Instanzen, dann Push pro Event."""
     orch = get_orchestrator()
-    initial = {"type": "state", "state": orch.state.to_json()}
+    initial = {
+        "type": "snapshot",
+        "instances": {k: v.to_json() for k, v in orch.state.instances.items()},
+    }
     await ws_hub.handle_client(ws, initial_message=initial)
 
 
@@ -898,9 +951,17 @@ def chat_proposals(
     ]
 
 
+class ProposalApplyRequest(BaseModel):
+    instrument: InstrumentName | None = Field(
+        default=None,
+        description=("Auf welche Bot-Instanz anwenden. None → alle Default-Instanzen "
+                     "(gleiche Params überall)"),
+    )
+
+
 @app.post("/chat/proposals/{prop_id}/apply", response_model=ProposalOut)
-async def chat_proposal_apply(prop_id: str) -> ProposalOut:
-    """Wendet einen Config-Diff-Vorschlag auf den BotState an."""
+async def chat_proposal_apply(prop_id: str, req: ProposalApplyRequest = ProposalApplyRequest()) -> ProposalOut:
+    """Wendet einen Config-Diff-Vorschlag auf eine (oder alle) Bot-Instanz(en) an."""
     state = get_chat_state()
     proposal = state.get_proposal(prop_id)
     if not proposal:
@@ -909,14 +970,20 @@ async def chat_proposal_apply(prop_id: str) -> ProposalOut:
         raise HTTPException(409, f"Vorschlag bereits {proposal.status}")
 
     orch = get_orchestrator()
+    targets = [req.instrument] if req.instrument else DEFAULT_INSTRUMENTS
     try:
-        await orch.apply_config_diff(proposal.diff)
+        for inst_name in targets:
+            await orch.apply_config_diff(inst_name, proposal.diff)
     except KeyError as e:
         raise HTTPException(400, str(e))
 
     state.mark_proposal(prop_id, "applied")
     refreshed = state.get_proposal(prop_id)
-    await ws_hub.push_to_dashboard({"type": "state", "state": orch.state.to_json()})
+    for inst_name in targets:
+        inst = orch.state.ensure(inst_name)
+        await ws_hub.push_to_dashboard({
+            "type": "instance_update", "instrument": inst_name, "instance": inst.to_json(),
+        })
     return ProposalOut(**refreshed.to_json())
 
 

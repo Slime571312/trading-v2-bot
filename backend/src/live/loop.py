@@ -1,22 +1,20 @@
-"""Tick-Loop des Live-Paper-Bots.
+"""Tick-Loop pro Bot-Instance.
 
-Asyncio-Task, der im FastAPI-Prozess läuft. Pro Tick:
-1. Lade aktuellste 1m-Bar für jedes Instrument (Cache, TTL 60s → frisch)
-2. Prüfe offene Trades intrabar gegen die 1m-Bar (SL/TP)
-3. Alle N Ticks (Default: jeden 5. = 5min): rufe `engine.evaluate()`
-   für jedes Instrument auf das keine offene Position hat
-4. Persistiere State, pushe Updates an alle WebSocket-Clients
+Eine asyncio.Task pro Instrument. Pro Tick:
+1. Lade 1m-Bar fürs Instrument (intrabar-Check)
+2. Prüfe offenen Trade gegen 1m-Bar (SL/TP intrabar)
+3. Alle N Ticks (Default 5): re-eval engine wenn kein offener Trade,
+   öffne ggf. Position
+4. Persistiere State + TickLog, pushe Update an WebSocket-Clients
 
-Robustheit:
-- Pro-Instrument-Try/Except → ein Capital-Fehler kappt nicht den ganzen Tick
-- Bot-Stop respektiert: vor jedem Schritt prüfen
-- Asyncio-Lock um State-Mutationen → keine Race mit HTTP-Handlern
+Jeder relevante Tick-Schritt erzeugt einen TickLogEntry — sichtbar im UI als
+„warum hat der Bot das gemacht"-Timeline.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import datetime, timezone
+from typing import TYPE_CHECKING
 
 import pandas as pd
 
@@ -24,162 +22,217 @@ from src.api.ws import push_to_dashboard
 from src.brokers.capital_com import CapitalAPIError, CapitalAuthError
 from src.data.fetcher import load_candles
 from src.strategy_core import evaluate as evaluate_signal
+from src.strategy_core.bias import compute_bias
 
 from . import paper_broker
-from .state import BotState, ClosedTrade, OpenTrade, save_state, _now
+from .state import (
+    BotInstance, BotState, ClosedTrade, OpenTrade, TickLogEntry,
+    save_state, _now,
+)
+
+if TYPE_CHECKING:
+    pass
 
 log = logging.getLogger(__name__)
 
-# Alle wie viele Ticks soll die Engine neu evaluieren? Bei 60s-Tick und 5m-Strategie:
-# 5 Ticks = 5 Minuten = Bar-Close-Rhythmus.
-SIGNAL_TICKS_INTERVAL = 5
-
-# TFs die das Engine-Eval braucht. 1m für intrabar SL/TP, 5m+15m+30m+1h+1d für Engine.
+SIGNAL_TICKS_INTERVAL = 5  # alle 5 Ticks Engine-Eval (bei 60s-Tick = 5min)
 LIVE_TFS = ["1d", "1h", "30m", "15m", "5m", "1m"]
 
 
-async def run_tick_loop(state: BotState, state_lock: asyncio.Lock) -> None:
-    """Endlos-Loop bis `state.running` auf False geht. Wird als asyncio.Task gestartet."""
-    log.info("Tick-Loop gestartet: tick_interval=%ds, instruments=%s",
-             state.tick_interval_s, state.instruments)
+async def run_tick_loop(
+    state: BotState,
+    instance: BotInstance,
+    state_lock: asyncio.Lock,
+) -> None:
+    """Endlos bis `instance.running=False`. Pro Tick: SL/TP-Check + ggf. Eval.
+
+    `state_lock` ist GLOBAL (1 Lock für die ganze BotState), damit
+    save_state() serialisiert ist.
+    """
+    inst_name = instance.instrument
+    log.info("Tick-Loop %s gestartet (interval=%ds)", inst_name, instance.tick_interval_s)
 
     tick_count = 0
-    while state.running:
+    while instance.running:
         tick_count += 1
         tick_start = _now()
         try:
-            await _do_tick(state, state_lock, tick_count)
+            await _do_tick(state, instance, state_lock, tick_count)
         except asyncio.CancelledError:
-            log.info("Tick-Loop abgebrochen (CancelledError)")
+            log.info("Tick-Loop %s abgebrochen", inst_name)
             raise
         except Exception as e:
-            log.exception("Tick-Loop unerwarteter Fehler — fahre fort: %s", e)
+            log.exception("Tick-Loop %s Fehler: %s", inst_name, e)
             async with state_lock:
-                state.last_error = f"{type(e).__name__}: {e}"
+                instance.last_error = f"{type(e).__name__}: {e}"
+                instance.append_tick_log(TickLogEntry(
+                    timestamp=tick_start, action="error",
+                    decision="tick_crashed", detail=str(e)[:200],
+                ))
                 save_state(state)
-            await push_to_dashboard({"type": "error", "message": str(e)})
+            await push_to_dashboard({
+                "type": "error", "instrument": inst_name, "message": str(e),
+            })
 
         async with state_lock:
-            state.last_tick = tick_start
+            instance.last_tick = tick_start
             save_state(state)
 
-        # Sleep so dass jeder Tick min. tick_interval_s vom vorherigen Start entfernt ist
+        # Push State-Update zum Browser
+        await push_to_dashboard({
+            "type": "instance_update", "instrument": inst_name,
+            "instance": instance.to_json(),
+        })
+
         elapsed = (_now() - tick_start).total_seconds()
-        sleep_for = max(1.0, state.tick_interval_s - elapsed)
+        sleep_for = max(1.0, instance.tick_interval_s - elapsed)
         try:
             await asyncio.sleep(sleep_for)
         except asyncio.CancelledError:
             raise
 
-    log.info("Tick-Loop beendet (running=False)")
+    log.info("Tick-Loop %s beendet", inst_name)
 
 
-async def _do_tick(state: BotState, state_lock: asyncio.Lock, tick_count: int) -> None:
-    """Ein einzelner Tick. Atomar pro State-Mutation via Lock."""
+async def _do_tick(
+    state: BotState,
+    instance: BotInstance,
+    state_lock: asyncio.Lock,
+    tick_count: int,
+) -> None:
+    """Ein Tick = SL/TP-Check + (alle N Ticks) Engine-Eval."""
+    inst_name = instance.instrument
     eval_this_tick = (tick_count % SIGNAL_TICKS_INTERVAL == 1)
 
-    # ── Step 1: pro Instrument 1m-Bar holen für intrabar-Check ───────────
-    latest_bars_1m: dict[str, pd.Series] = {}
-    for inst in state.instruments:
-        try:
-            df = await load_candles(inst, "1m", bars=20)
-            if not df.empty:
-                latest_bars_1m[inst] = df.iloc[-1]
-        except (CapitalAuthError, CapitalAPIError) as e:
-            log.warning("tick %d: 1m-Fetch %s fehlgeschlagen: %s", tick_count, inst, e)
+    # ── 1. 1m-Bar fetchen für intrabar-Check ─────────────────────────
+    try:
+        df_1m = await load_candles(inst_name, "1m", bars=20)
+        latest_bar = df_1m.iloc[-1] if not df_1m.empty else None
+    except (CapitalAuthError, CapitalAPIError) as e:
+        log.warning("%s tick %d: 1m-Fetch fehlgeschlagen: %s", inst_name, tick_count, e)
+        latest_bar = None
 
-    # ── Step 2: offene Trades intrabar-Check (SL/TP) ─────────────────────
-    closed_this_tick: list[ClosedTrade] = []
-    async with state_lock:
-        still_open: list[OpenTrade] = []
-        for trade in state.open_trades:
-            bar = latest_bars_1m.get(trade.instrument)
-            if bar is None:
-                still_open.append(trade)
-                continue
-            exit_hit = paper_broker.check_intrabar_exit(trade, bar)
-            if exit_hit is None:
-                still_open.append(trade)
-                continue
-            exit_raw, reason = exit_hit
-            closed = paper_broker.close_position(trade, exit_raw, bar, reason)
-            state.equity += closed.pnl_abs
-            state.closed_trades.append(closed)
-            closed_this_tick.append(closed)
-            log.info(
-                "TRADE CLOSED %s %s %s → %.2f (%+.2fR, reason=%s)",
-                closed.instrument, closed.side, closed.id,
-                closed.pnl_abs, closed.r_multiple, closed.exit_reason,
-            )
-        state.open_trades = still_open
-        if closed_this_tick:
-            save_state(state)
+    # ── 2. Offene Trades intrabar-Check ──────────────────────────────
+    if latest_bar is not None:
+        async with state_lock:
+            still_open: list[OpenTrade] = []
+            for trade in instance.open_trades:
+                exit_hit = paper_broker.check_intrabar_exit(trade, latest_bar)
+                if exit_hit is None:
+                    still_open.append(trade)
+                    continue
+                exit_raw, reason = exit_hit
+                closed = paper_broker.close_position(trade, exit_raw, latest_bar, reason)
+                instance.equity += closed.pnl_abs
+                instance.closed_trades.append(closed)
+                instance.append_tick_log(TickLogEntry(
+                    timestamp=_now(), action="close",
+                    decision=f"closed_{reason}",
+                    variant=closed.variant,
+                    detail=(f"{closed.side} @ {closed.exit:.2f} → "
+                            f"{closed.pnl_abs:+.2f} ({closed.r_multiple:+.2f}R)"),
+                    related_trade_id=closed.id,
+                ))
+                log.info("%s CLOSED %s %s %s → %.2f (%+.2fR)",
+                         inst_name, closed.side, closed.id, closed.exit_reason,
+                         closed.pnl_abs, closed.r_multiple)
+                await push_to_dashboard({
+                    "type": "trade_closed", "instrument": inst_name,
+                    "trade": closed.to_json(),
+                })
+            instance.open_trades = still_open
 
-    for ct in closed_this_tick:
-        await push_to_dashboard({"type": "trade_closed", "trade": ct.to_json()})
-
-    # ── Step 3: optional Engine-Eval für neue Entries ────────────────────
+    # ── 3. Engine-Eval für neue Entries (nur alle N Ticks) ──────────
     if not eval_this_tick:
-        await push_to_dashboard(_state_snapshot(state))
         return
 
     async with state_lock:
-        state.last_signal_check = _now()
-    open_instruments = {t.instrument for t in state.open_trades}
+        instance.last_signal_check = _now()
 
-    opened_this_tick: list[OpenTrade] = []
-    for inst in state.instruments:
-        if inst in open_instruments:
-            continue
-        try:
-            bars: dict[str, pd.DataFrame] = {}
-            for tf in LIVE_TFS:
-                df = await load_candles(inst, tf, bars=200)
-                if not df.empty:
-                    bars[tf] = df
-            if "1d" not in bars or "5m" not in bars:
-                continue
-            signal = evaluate_signal(
-                inst, bars,
-                rr_threshold=state.rr_threshold,
-                sweep_lookback_bars=state.sweep_lookback,
-            )
-            if signal is None:
-                continue
+    if instance.open_trades:
+        instance.append_tick_log(TickLogEntry(
+            timestamp=_now(), action="skip", decision="already_in_position",
+            detail=f"open: {instance.open_trades[0].id}",
+        ))
+        return
 
-            current_bar = latest_bars_1m.get(inst)
-            if current_bar is None:
-                current_bar = bars["5m"].iloc[-1]
-            new_trade = paper_broker.open_position(
-                signal, state.equity, state.risk_pct, current_bar,
-            )
-            if new_trade is None:
-                continue
+    try:
+        bars: dict[str, pd.DataFrame] = {}
+        for tf in LIVE_TFS:
+            df = await load_candles(inst_name, tf, bars=200)
+            if not df.empty:
+                bars[tf] = df
+        if "1d" not in bars or "5m" not in bars:
+            instance.append_tick_log(TickLogEntry(
+                timestamp=_now(), action="error",
+                decision="missing_required_tf",
+                detail=f"have: {sorted(bars.keys())}",
+            ))
+            return
 
-            async with state_lock:
-                # State-Validation: in der Zwischenzeit doch eine Position?
-                if any(t.instrument == inst for t in state.open_trades):
-                    log.info("tick %d: %s zwischenzeitlich Position — skip", tick_count, inst)
-                    continue
-                state.open_trades.append(new_trade)
-                save_state(state)
-            opened_this_tick.append(new_trade)
-            log.info(
-                "TRADE OPENED %s %s %s @ %.2f, SL=%.2f, TP=%.2f, RR=%.2f, size=%.4f",
-                new_trade.instrument, new_trade.side, new_trade.id,
-                new_trade.entry, new_trade.sl, new_trade.tp,
-                new_trade.rr_at_open, new_trade.size,
-            )
-        except (CapitalAuthError, CapitalAPIError) as e:
-            log.warning("tick %d: engine-eval %s gescheitert: %s", tick_count, inst, e)
-        except Exception as e:
-            log.exception("tick %d: engine-eval %s unerwarteter Fehler: %s", tick_count, inst, e)
+        bias = compute_bias(bars["1d"])
+        signal = evaluate_signal(
+            inst_name, bars,
+            rr_threshold=instance.rr_threshold,
+            sweep_lookback_bars=instance.sweep_lookback,
+        )
 
-    for ot in opened_this_tick:
-        await push_to_dashboard({"type": "trade_opened", "trade": ot.to_json()})
+        if signal is None:
+            instance.append_tick_log(TickLogEntry(
+                timestamp=_now(), action="eval", decision="no_setup",
+                bias=bias.direction,
+                detail=(
+                    "neutraler Daily-Bias" if bias.direction == "neutral"
+                    else "kein HTF-Sweep + LTF-BOS im Lookback-Fenster"
+                ),
+            ))
+            return
 
-    await push_to_dashboard(_state_snapshot(state))
+        current_bar = latest_bar if latest_bar is not None else bars["5m"].iloc[-1]
+        new_trade = paper_broker.open_position(
+            signal, instance.equity, instance.risk_pct, current_bar,
+        )
+        if new_trade is None:
+            instance.append_tick_log(TickLogEntry(
+                timestamp=_now(), action="skip",
+                decision="degenerate_signal_sl_eq_entry",
+                bias=bias.direction, htf_used=signal.htf_used,
+                ltf_used=signal.ltf_used, rr_computed=signal.rr,
+                variant=signal.variant,
+            ))
+            return
 
+        async with state_lock:
+            if instance.open_trades:
+                log.info("%s: zwischenzeitlich Position eröffnet — skip", inst_name)
+                return
+            instance.open_trades.append(new_trade)
+            instance.append_tick_log(TickLogEntry(
+                timestamp=_now(), action="open",
+                decision=f"opened_{signal.variant}",
+                bias=bias.direction,
+                htf_used=signal.htf_used,
+                ltf_used=signal.ltf_used,
+                sweep_time=signal.sweep.time.isoformat(),
+                sweep_direction=signal.sweep.direction,
+                bos_time=signal.structure_break.time.isoformat(),
+                rr_computed=round(signal.rr, 3),
+                variant=signal.variant,
+                detail=(f"{new_trade.side} @ {new_trade.entry:.2f}, "
+                        f"SL={new_trade.sl:.2f}, TP={new_trade.tp:.2f}"),
+                related_trade_id=new_trade.id,
+            ))
+        log.info("%s OPENED %s %s %s @ %.2f SL=%.2f TP=%.2f RR=%.2f",
+                 inst_name, new_trade.side, new_trade.id, new_trade.variant,
+                 new_trade.entry, new_trade.sl, new_trade.tp, new_trade.rr_at_open)
+        await push_to_dashboard({
+            "type": "trade_opened", "instrument": inst_name,
+            "trade": new_trade.to_json(),
+        })
 
-def _state_snapshot(state: BotState) -> dict:
-    return {"type": "state", "state": state.to_json()}
+    except (CapitalAuthError, CapitalAPIError) as e:
+        instance.append_tick_log(TickLogEntry(
+            timestamp=_now(), action="error",
+            decision="capital_api_error", detail=str(e)[:200],
+        ))
+        log.warning("%s eval Capital-Fehler: %s", inst_name, e)

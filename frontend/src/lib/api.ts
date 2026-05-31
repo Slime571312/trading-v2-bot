@@ -5,10 +5,12 @@ export type Timeframe = "1m" | "5m" | "15m" | "30m" | "1h" | "4h" | "1d";
 
 export interface SignalResponse {
   instrument: string;
-  side: "long" | "short" | "none";
+  epic?: string | null;
+  refreshed_at?: string | null;
+  side: "long" | "short" | "none" | "error";
   bias_direction: "long" | "short" | "neutral";
-  bias_bos_time: string | null;
-  bias_bos_level: number | null;
+  bias_bos_time?: string | null;
+  bias_bos_level?: number | null;
   variant: "primary" | "ob_retest" | "fvg_retest" | "ultimate" | null;
   entry: number | null;
   sl: number | null;
@@ -19,6 +21,7 @@ export interface SignalResponse {
   has_ob: boolean;
   has_fvg: boolean;
   reason: string;
+  error?: string | null;
 }
 
 export interface MetricsOut {
@@ -137,7 +140,7 @@ export async function runBacktest(req: BacktestRequest): Promise<BacktestRespons
   return res.json();
 }
 
-// ─── Live Bot ──────────────────────────────────────────────────────────
+// ─── Multi-Bot (eine Instanz pro Instrument) ───────────────────────────
 
 export interface OpenTrade {
   id: string;
@@ -163,7 +166,24 @@ export interface ClosedTrade extends OpenTrade {
   exit_reason: "sl" | "tp" | "manual" | "bot_stopped";
 }
 
-export interface BotState {
+export interface TickLogEntry {
+  timestamp: string;
+  action: "eval" | "open" | "close" | "skip" | "error" | "outside_session";
+  decision: string;
+  bias: string | null;
+  htf_used: string | null;
+  ltf_used: string | null;
+  sweep_time: string | null;
+  sweep_direction: string | null;
+  bos_time: string | null;
+  rr_computed: number | null;
+  variant: string | null;
+  detail: string | null;
+  related_trade_id: string | null;
+}
+
+export interface BotInstance {
+  instrument: string;
   running: boolean;
   started_at: string | null;
   stopped_at: string | null;
@@ -172,52 +192,117 @@ export interface BotState {
   tick_interval_s: number;
   initial_capital: number;
   equity: number;
-  instruments: string[];
   open_trades: OpenTrade[];
   closed_trades: ClosedTrade[];
   last_error: string | null;
   rr_threshold: number;
   risk_pct: number;
   sweep_lookback: number;
-  n_ws_clients?: number;
+  n_tick_log: number;
+}
+
+export interface BotOverview {
+  instances: BotInstance[];
+  total_equity: number;
+  any_running: boolean;
+  n_ws_clients: number;
 }
 
 export interface BotStartRequest {
   initial_capital?: number;
   tick_interval_s?: number;
-  instruments?: Instrument[];
   rr_threshold?: number;
   risk_pct?: number;
   sweep_lookback?: number;
   reset?: boolean;
 }
 
-export async function fetchBotState(): Promise<BotState> {
-  const res = await fetch(`${BASE}/bot/state`, { cache: "no-store" });
-  if (!res.ok) throw new Error(`bot/state ${res.status}`);
+export async function fetchBotOverview(): Promise<BotOverview> {
+  const res = await fetch(`${BASE}/bot/instances`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`bot/instances ${res.status}`);
   return res.json();
 }
 
-export async function startBot(req: BotStartRequest = {}): Promise<BotState> {
-  const res = await fetch(`${BASE}/bot/start`, {
+export async function fetchBotInstance(instrument: Instrument): Promise<BotInstance> {
+  const res = await fetch(`${BASE}/bot/${instrument}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`bot/${instrument} ${res.status}`);
+  return res.json();
+}
+
+export async function startBot(instrument: Instrument, req: BotStartRequest = {}): Promise<BotInstance> {
+  const res = await fetch(`${BASE}/bot/${instrument}/start`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(req),
   });
-  if (!res.ok) throw new Error(`bot/start ${res.status}`);
+  if (!res.ok) throw new Error(`bot/${instrument}/start ${res.status}`);
   return res.json();
 }
 
-export async function stopBot(): Promise<BotState> {
-  const res = await fetch(`${BASE}/bot/stop`, { method: "POST" });
-  if (!res.ok) throw new Error(`bot/stop ${res.status}`);
+export async function stopBot(instrument: Instrument): Promise<BotInstance> {
+  const res = await fetch(`${BASE}/bot/${instrument}/stop`, { method: "POST" });
+  if (!res.ok) throw new Error(`bot/${instrument}/stop ${res.status}`);
   return res.json();
 }
 
-export async function resetBot(): Promise<BotState> {
-  const res = await fetch(`${BASE}/bot/reset`, { method: "POST" });
-  if (!res.ok) throw new Error(`bot/reset ${res.status}`);
+export async function resetBot(instrument: Instrument): Promise<BotInstance> {
+  const res = await fetch(`${BASE}/bot/${instrument}/reset`, { method: "POST" });
+  if (!res.ok) throw new Error(`bot/${instrument}/reset ${res.status}`);
   return res.json();
+}
+
+export async function startAllBots(req: BotStartRequest & { instruments?: Instrument[] } = {}): Promise<BotOverview> {
+  const res = await fetch(`${BASE}/bot/start-all`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(req),
+  });
+  if (!res.ok) throw new Error(`bot/start-all ${res.status}`);
+  return res.json();
+}
+
+export async function stopAllBots(): Promise<BotOverview> {
+  const res = await fetch(`${BASE}/bot/stop-all`, { method: "POST" });
+  if (!res.ok) throw new Error(`bot/stop-all ${res.status}`);
+  return res.json();
+}
+
+export async function fetchTickLog(instrument: Instrument, limit = 50): Promise<TickLogEntry[]> {
+  const res = await fetch(`${BASE}/bot/${instrument}/ticks?limit=${limit}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`bot/${instrument}/ticks ${res.status}`);
+  return res.json();
+}
+
+// ─── Signals (Batch + Cache) ───────────────────────────────────────────
+
+export interface CachedSignal {
+  instrument: string;
+  epic: string | null;
+  refreshed_at: string | null;
+  side: "long" | "short" | "none" | "error";
+  bias_direction: "long" | "short" | "neutral";
+  variant: string | null;
+  entry: number | null;
+  sl: number | null;
+  tp: number | null;
+  rr: number | null;
+  htf_used: string | null;
+  ltf_used: string | null;
+  has_ob: boolean;
+  has_fvg: boolean;
+  reason: string;
+  error: string | null;
+}
+
+export async function fetchSignalsBatch(): Promise<CachedSignal[]> {
+  const res = await fetch(`${BASE}/signals`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`signals ${res.status}`);
+  return res.json();
+}
+
+export async function refreshSignals(instrument?: Instrument): Promise<void> {
+  const url = instrument ? `${BASE}/signals/refresh?instrument=${instrument}` : `${BASE}/signals/refresh`;
+  await fetch(url, { method: "POST" });
 }
 
 // ─── Chat ──────────────────────────────────────────────────────────────

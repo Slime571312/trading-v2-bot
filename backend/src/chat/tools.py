@@ -60,47 +60,72 @@ def _text(payload: dict | str) -> dict:
 
 
 async def _impl_read_status(_: dict[str, Any]) -> dict:
-    """Snapshot des Live-Bots: running, equity, open trades, params."""
+    """Snapshot aller Bot-Instanzen (Multi-Bot): pro Instrument running, equity, params."""
     orch = get_orchestrator()
-    s = orch.state
-    payload = {
-        "running": s.running,
-        "equity": round(s.equity, 2),
-        "initial_capital": s.initial_capital,
-        "pnl_abs": round(s.equity - s.initial_capital, 2),
-        "pnl_pct": round((s.equity - s.initial_capital) / s.initial_capital * 100, 2) if s.initial_capital else 0,
-        "open_trades": [
-            {
-                "instrument": t.instrument, "side": t.side,
-                "entry": t.entry, "sl": t.sl, "tp": t.tp, "size": t.size,
-                "variant": t.variant, "rr_at_open": t.rr_at_open,
-                "open_time": t.open_time.isoformat() if t.open_time else None,
-            }
-            for t in s.open_trades
-        ],
-        "n_closed": len(s.closed_trades),
-        "wins_total": sum(1 for t in s.closed_trades if t.r_multiple > 0),
-        "instruments": s.instruments,
-        "rr_threshold": s.rr_threshold,
-        "risk_pct": s.risk_pct,
-        "sweep_lookback": s.sweep_lookback,
-        "tick_interval_s": s.tick_interval_s,
-        "last_tick": s.last_tick.isoformat() if s.last_tick else None,
-        "last_signal_check": s.last_signal_check.isoformat() if s.last_signal_check else None,
-        "started_at": s.started_at.isoformat() if s.started_at else None,
-        "last_error": s.last_error,
-    }
-    return _text(payload)
+    instances = []
+    total_equity = 0.0
+    total_initial = 0.0
+    total_open = 0
+    total_closed = 0
+    total_wins = 0
+    for inst_name, inst in orch.state.instances.items():
+        wins = sum(1 for t in inst.closed_trades if t.r_multiple > 0)
+        total_equity += inst.equity
+        total_initial += inst.initial_capital
+        total_open += len(inst.open_trades)
+        total_closed += len(inst.closed_trades)
+        total_wins += wins
+        instances.append({
+            "instrument": inst_name,
+            "running": inst.running,
+            "equity": round(inst.equity, 2),
+            "initial_capital": inst.initial_capital,
+            "pnl_abs": round(inst.equity - inst.initial_capital, 2),
+            "pnl_pct": round((inst.equity - inst.initial_capital) / inst.initial_capital * 100, 2)
+                       if inst.initial_capital else 0,
+            "rr_threshold": inst.rr_threshold,
+            "risk_pct": inst.risk_pct,
+            "sweep_lookback": inst.sweep_lookback,
+            "tick_interval_s": inst.tick_interval_s,
+            "n_open": len(inst.open_trades),
+            "n_closed": len(inst.closed_trades),
+            "wins": wins,
+            "last_tick": inst.last_tick.isoformat() if inst.last_tick else None,
+            "last_signal_check": inst.last_signal_check.isoformat() if inst.last_signal_check else None,
+            "last_error": inst.last_error,
+            "open_trades": [
+                {
+                    "side": t.side, "entry": t.entry, "sl": t.sl, "tp": t.tp,
+                    "variant": t.variant, "rr_at_open": t.rr_at_open,
+                    "open_time": t.open_time.isoformat() if t.open_time else None,
+                }
+                for t in inst.open_trades
+            ],
+        })
+    return _text({
+        "instances": instances,
+        "totals": {
+            "equity": round(total_equity, 2),
+            "initial_capital": round(total_initial, 2),
+            "pnl_abs": round(total_equity - total_initial, 2),
+            "n_open_trades": total_open,
+            "n_closed_trades": total_closed,
+            "wins": total_wins,
+            "overall_win_rate": round(total_wins / total_closed, 4) if total_closed else None,
+        },
+    })
 
 
 async def _impl_get_recent_trades(args: dict[str, Any]) -> dict:
     limit = min(int(args.get("limit", 20)), 100)
     instrument = args.get("instrument")
     orch = get_orchestrator()
-    trades = orch.state.closed_trades
-    if instrument:
-        trades = [t for t in trades if t.instrument == instrument]
-    trades = sorted(trades, key=lambda t: t.close_time, reverse=True)[:limit]
+    all_trades = []
+    for inst_name, inst in orch.state.instances.items():
+        if instrument and inst_name != instrument:
+            continue
+        all_trades.extend(inst.closed_trades)
+    trades = sorted(all_trades, key=lambda t: t.close_time, reverse=True)[:limit]
     if not trades:
         return _text({"trades": [], "note": f"keine Trades{' für ' + instrument if instrument else ''}"})
     wins = sum(1 for t in trades if t.r_multiple > 0)
