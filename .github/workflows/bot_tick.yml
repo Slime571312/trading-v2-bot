@@ -34,11 +34,11 @@ jobs:
       - name: Dependencies installieren
         run: pip install -r backend/requirements-bot.txt
 
+      - name: Credentials laden
+        run: echo "${{ secrets.BOT }}" > backend/.env
+
       - name: Bot Tick ausführen
         env:
-          CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
-          CAPITAL_EMAIL: ${{ secrets.CAPITAL_EMAIL }}
-          CAPITAL_API_PASSWORD: ${{ secrets.CAPITAL_API_PASSWORD }}
           CACHE_DIR: /tmp/bot_cache
           PYTHONPATH: backend
         run: python -m src.live.gh_runner
