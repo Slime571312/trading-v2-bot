@@ -872,6 +872,16 @@ export default function LivePage() {
     catch (e) { setErr(String(e)); }
     finally { setBusy(false); }
   }
+  async function handleSync() {
+    setBusy(true); setErr(null);
+    try {
+      const r = await fetch("http://localhost:8000/bot/sync", { method: "POST" });
+      const d = await r.json();
+      if (d.synced) await reload();
+      else setErr(d.message);
+    } catch (e) { setErr(String(e)); }
+    finally { setBusy(false); }
+  }
 
   if (instances.length === 0) {
     return <p style={{ color: "var(--text-dim)" }}>Lade Bot-Status... (Backend offline?)</p>;
@@ -905,6 +915,10 @@ export default function LivePage() {
           <span style={{ fontSize: 10, color: "var(--text-dim)" }}>WS: {wsStatus}</span>
         </div>
         <div style={{ display: "flex", gap: 6 }}>
+          <button onClick={handleSync} disabled={busy}
+            style={btnLg("var(--accent)")}>
+            ↻ Sync
+          </button>
           <button onClick={handleStartAll} disabled={busy || runningCount === instances.length}
             style={btnLg("var(--green)")}>
             ▶ Start all

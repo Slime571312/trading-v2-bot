@@ -57,11 +57,26 @@ async def lifespan(app: FastAPI):
     log_app.info("SignalCache Background-Task gestartet")
 
     async def _gh_actions_sync():
-        """Lädt State alle 60s neu — zeigt GH-Actions-Updates wenn kein lokaler Bot läuft."""
+        """Alle 60s: git pull → live_state.json neu lesen → Dashboard aktuell."""
         import asyncio as _asyncio
+        import subprocess
+        repo_root = Path(__file__).resolve().parents[3]
         while True:
             await _asyncio.sleep(60)
-            orch.reload_from_file()
+            if not orch.any_running():
+                try:
+                    proc = subprocess.run(
+                        ["git", "fetch", "origin", "main"],
+                        cwd=repo_root, capture_output=True, timeout=15,
+                    )
+                    subprocess.run(
+                        ["git", "checkout", "origin/main", "--",
+                         "backend/state/live_state.json"],
+                        cwd=repo_root, capture_output=True, timeout=10,
+                    )
+                except Exception:
+                    pass
+                orch.reload_from_file()
 
     sync_task = asyncio.create_task(_gh_actions_sync(), name="gh_state_sync")
     log_app.info("GitHub-Actions-State-Sync gestartet (60s Intervall)")
@@ -993,21 +1008,22 @@ async def bot_stop_all() -> BotOverviewResponse:
 
 @app.post("/bot/sync")
 async def bot_sync_from_github() -> dict:
-    """Lädt live_state.json sofort neu — holt GH-Actions-Updates ohne Server-Neustart.
-
-    Nur wirksam wenn keine Bots lokal laufen (sonst würde laufender State überschrieben).
-    """
+    """git pull → live_state.json neu laden — holt GH-Actions-Updates sofort."""
+    import subprocess
     orch = get_orchestrator()
-    was_running = orch.any_running()
-    if not was_running:
-        orch.reload_from_file()
-    return {
-        "synced": not was_running,
-        "message": (
-            "State neu geladen" if not was_running
-            else "Übersprungen — lokale Bots laufen noch"
-        ),
-    }
+    if orch.any_running():
+        return {"synced": False, "message": "Übersprungen — lokale Bots laufen noch"}
+    repo_root = Path(__file__).resolve().parents[3]
+    try:
+        subprocess.run(["git", "fetch", "origin", "main"],
+                       cwd=repo_root, capture_output=True, timeout=15)
+        subprocess.run(["git", "checkout", "origin/main", "--",
+                        "backend/state/live_state.json"],
+                       cwd=repo_root, capture_output=True, timeout=10)
+    except Exception as e:
+        return {"synced": False, "message": f"git fetch fehlgeschlagen: {e}"}
+    orch.reload_from_file()
+    return {"synced": True, "message": "State von GitHub geholt und neu geladen"}
 
 
 @app.websocket("/ws/live")
