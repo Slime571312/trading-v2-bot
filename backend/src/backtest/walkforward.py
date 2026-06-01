@@ -39,9 +39,9 @@ class WalkForwardResult:
     win_rate: float = 0.0
     total_return_pct: float = 0.0
     avg_expectancy_r: float = 0.0
-    avg_profit_factor: float = 0.0
+    avg_profit_factor: float | None = None
     avg_max_drawdown_pct: float = 0.0
-    avg_sharpe: float = 0.0
+    avg_sharpe: float | None = None
     # Robustness: Anteil Fenster mit Expectancy > 0
     pct_windows_positive: float = 0.0
 
@@ -142,9 +142,14 @@ async def run_walk_forward(
 
     n_w = len(windows)
     avg_expectancy_r = sum(w.result.metrics.expectancy_r for w in windows) / n_w
-    avg_profit_factor = sum(w.result.metrics.profit_factor for w in windows) / n_w
     avg_max_drawdown_pct = sum(w.result.metrics.max_drawdown_pct for w in windows) / n_w
-    avg_sharpe = sum(w.result.metrics.sharpe for w in windows) / n_w
+    # profit_factor / sharpe können None sein (keine Losses / std=0) — None-Werte rausfiltern
+    pf_vals = [w.result.metrics.profit_factor for w in windows
+               if w.result.metrics.profit_factor is not None]
+    avg_profit_factor: float | None = sum(pf_vals) / len(pf_vals) if pf_vals else None
+    sh_vals = [w.result.metrics.sharpe for w in windows
+               if w.result.metrics.sharpe is not None]
+    avg_sharpe: float | None = sum(sh_vals) / len(sh_vals) if sh_vals else None
 
     final_equities = [w.result.final_equity for w in windows]
     total_return_pct = (

@@ -20,8 +20,8 @@ def compute_metrics(
         return BacktestMetrics(
             total_trades=0, wins=0, losses=0, win_rate=0.0,
             total_return_pct=0.0, avg_win_r=0.0, avg_loss_r=0.0,
-            profit_factor=0.0, max_drawdown_pct=0.0, expectancy_r=0.0,
-            sharpe=0.0, exposure_pct=0.0, longs=0, shorts=0,
+            profit_factor=None, max_drawdown_pct=0.0, expectancy_r=0.0,
+            sharpe=None, exposure_pct=0.0, longs=0, shorts=0,
         )
 
     rs = np.array([t.r_multiple for t in trades], dtype=float)
@@ -34,7 +34,13 @@ def compute_metrics(
 
     sum_wins = float(rs[rs > 0].sum())
     sum_losses = float(abs(rs[rs <= 0].sum()))
-    profit_factor = sum_wins / sum_losses if sum_losses > 0 else float("inf") if sum_wins > 0 else 0.0
+    # Profit-Factor: None wenn unbestimmt (kein Loss → division-by-zero/inf).
+    # JSON-Standard kennt kein Infinity; lieber explizit null senden, das Frontend
+    # rendert dann "∞" wenn wins>0 sonst "—".
+    if sum_losses > 0:
+        profit_factor: float | None = sum_wins / sum_losses
+    else:
+        profit_factor = None
     expectancy_r = float(rs.mean())
 
     final_equity = equity_curve[-1][1] if equity_curve else initial_capital
@@ -59,9 +65,9 @@ def compute_metrics(
             "1m": 525_600, "5m": 105_120, "15m": 35_040, "30m": 17_520,
             "1h": 8_760, "1d": 365,
         }.get(iter_tf, 525_600)
-        sharpe = (mean / std) * math.sqrt(bars_per_year) if std > 0 else 0.0
+        sharpe: float | None = (mean / std) * math.sqrt(bars_per_year) if std > 0 else None
     else:
-        sharpe = 0.0
+        sharpe = None
 
     # Exposure: Anteil der Zeit im Trade
     total_bars = sum(t.bars_held for t in trades)

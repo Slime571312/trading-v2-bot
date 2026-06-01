@@ -50,18 +50,33 @@ function MetricsGrid({ m, initial, final: finalEq }: {
   initial: number;
   final: number;
 }) {
-  const returnPos = m.total_return_pct >= 0;
-  const cells = [
+  const returnPos = (m.total_return_pct ?? 0) >= 0;
+  // Null-safe helper: Backend kann inf/NaN als null senden (Pydantic v2 default).
+  const fx = (v: number | null | undefined, digits = 2, prefix = "") =>
+    v === null || v === undefined || !isFinite(v) ? "—" : `${prefix}${v.toFixed(digits)}`;
+  const pct = (v: number | null | undefined, digits = 1) =>
+    v === null || v === undefined || !isFinite(v) ? "—" : `${v.toFixed(digits)}%`;
+  const signedPct = (v: number | null | undefined, digits = 2) =>
+    v === null || v === undefined || !isFinite(v) ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(digits)}%`;
+  const signedR = (v: number | null | undefined, digits = 2) =>
+    v === null || v === undefined || !isFinite(v) ? "—" : `${v >= 0 ? "+" : ""}${v.toFixed(digits)}R`;
+
+  // Profit-Factor: Backend liefert null für Inf (kein Loss überhaupt)
+  const pfCell = m.profit_factor === null || m.profit_factor === undefined
+    ? (m.wins > 0 && m.losses === 0 ? "∞" : "—")
+    : !isFinite(m.profit_factor) ? "∞" : m.profit_factor.toFixed(2);
+
+  const cells: [string, string][] = [
     ["Trades", `${m.total_trades} (${m.longs}L / ${m.shorts}S)`],
-    ["Win-Rate", `${(m.win_rate * 100).toFixed(1)}%`],
-    ["Return", `${returnPos ? "+" : ""}${m.total_return_pct.toFixed(2)}%`],
-    ["Max DD", `${m.max_drawdown_pct.toFixed(2)}%`],
-    ["Expectancy", `${m.expectancy_r >= 0 ? "+" : ""}${m.expectancy_r.toFixed(2)}R`],
-    ["Profit Factor", m.profit_factor === Infinity ? "∞" : m.profit_factor.toFixed(2)],
-    ["Sharpe", m.sharpe.toFixed(2)],
-    ["Exposure", `${m.exposure_pct.toFixed(1)}%`],
-    ["Avg Win", `+${m.avg_win_r.toFixed(2)}R`],
-    ["Avg Loss", `${m.avg_loss_r.toFixed(2)}R`],
+    ["Win-Rate", pct((m.win_rate ?? 0) * 100, 1)],
+    ["Return", signedPct(m.total_return_pct)],
+    ["Max DD", pct(m.max_drawdown_pct, 2)],
+    ["Expectancy", signedR(m.expectancy_r)],
+    ["Profit Factor", pfCell],
+    ["Sharpe", fx(m.sharpe)],
+    ["Exposure", pct(m.exposure_pct, 1)],
+    ["Avg Win", signedR(m.avg_win_r)],
+    ["Avg Loss", signedR(m.avg_loss_r)],
     ["Final Equity", `€${finalEq.toLocaleString("de-DE", { minimumFractionDigits: 2 })}`],
     ["Initial", `€${initial.toLocaleString("de-DE", { minimumFractionDigits: 2 })}`],
   ];
@@ -120,7 +135,27 @@ export default function BacktestPage() {
   const set = (k: keyof BacktestRequest) => (v: string) =>
     setForm((f) => ({ ...f, [k]: typeof f[k] === "number" ? parseFloat(v) || 0 : v }));
 
+  // Client-seitige Vorab-Validierung — gleiche Bounds wie Backend, damit der
+  // User direkt sieht was schief läuft statt eines 422 vom Server.
+  function validate(f: BacktestRequest): string | null {
+    if (f.bars < 200 || f.bars > 1000) return `Bars: ${f.bars} — muss 200–1000 sein`;
+    if (f.initial_capital < 100) return `Start-Kapital: ${f.initial_capital} — min 100`;
+    if (f.rr_threshold < 1.0 || f.rr_threshold > 5.0) return `RR-Schwelle: ${f.rr_threshold} — muss 1.0–5.0 sein`;
+    if (f.risk_pct < 0.001 || f.risk_pct > 0.05) return `Risk %: ${f.risk_pct} — muss 0.001–0.05 sein (0.1%–5%)`;
+    if (f.sweep_lookback < 3 || f.sweep_lookback > 50) return `Sweep-Lookback: ${f.sweep_lookback} — muss 3–50 sein`;
+    if (f.with_walkforward) {
+      if (f.wfo_oos_bars < 50 || f.wfo_oos_bars > 500) return `WFO OOS: ${f.wfo_oos_bars} — muss 50–500 sein`;
+      if (f.wfo_in_sample_bars < 100 || f.wfo_in_sample_bars > 900) return `WFO In-Sample: ${f.wfo_in_sample_bars} — muss 100–900 sein`;
+    }
+    return null;
+  }
+
   async function handleRun() {
+    const validationErr = validate(form);
+    if (validationErr) {
+      setError(validationErr);
+      return;
+    }
     setLoading(true);
     setError(null);
     setResult(null);
@@ -128,7 +163,7 @@ export default function BacktestPage() {
       const r = await runBacktest(form);
       setResult(r);
     } catch (e) {
-      setError(String(e));
+      setError(e instanceof Error ? e.message : String(e));
     } finally {
       setLoading(false);
     }
@@ -291,9 +326,29 @@ export default function BacktestPage() {
             color: "var(--red)",
             marginBottom: 20,
             fontSize: 13,
+            display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12,
           }}
         >
-          {error}
+          <div style={{ whiteSpace: "pre-wrap", flex: 1, fontFamily: "ui-monospace, monospace" }}>
+            ⚠ {error}
+          </div>
+          <button
+            onClick={() => {
+              setForm({
+                instrument: "BTC", iter_tf: "5m", bars: 1000, initial_capital: 10000,
+                rr_threshold: 2.0, risk_pct: 0.01, sweep_lookback: 10,
+                with_walkforward: false, wfo_oos_bars: 200, wfo_in_sample_bars: 500,
+              });
+              setError(null);
+            }}
+            style={{
+              background: "transparent", border: "1px solid var(--red)", color: "var(--red)",
+              padding: "3px 10px", borderRadius: 5, fontSize: 11, cursor: "pointer",
+              whiteSpace: "nowrap",
+            }}
+          >
+            ↺ Defaults
+          </button>
         </div>
       )}
 
@@ -364,13 +419,18 @@ export default function BacktestPage() {
                 Walk-Forward — {result.walkforward.n_windows} OOS-Fenster
               </div>
               <div style={{ display: "flex", gap: 20, flexWrap: "wrap", marginBottom: 14, fontSize: 13 }}>
-                {[
-                  ["Win-Rate", `${(result.walkforward.win_rate * 100).toFixed(1)}%`],
-                  ["Avg Expectancy", `${result.walkforward.avg_expectancy_r >= 0 ? "+" : ""}${result.walkforward.avg_expectancy_r.toFixed(2)}R`],
-                  ["Fenster positiv", `${(result.walkforward.pct_windows_positive * 100).toFixed(0)}%`],
-                  ["Avg Sharpe", result.walkforward.avg_sharpe.toFixed(2)],
-                  ["Avg Max DD", `${result.walkforward.avg_max_drawdown_pct.toFixed(2)}%`],
-                ].map(([k, v]) => (
+                {(() => {
+                  const wf = result.walkforward!;
+                  const safe = (v: number | null | undefined, fmt: (n: number) => string) =>
+                    v === null || v === undefined || !isFinite(v) ? "—" : fmt(v);
+                  return [
+                    ["Win-Rate", safe(wf.win_rate, (v) => `${(v * 100).toFixed(1)}%`)],
+                    ["Avg Expectancy", safe(wf.avg_expectancy_r, (v) => `${v >= 0 ? "+" : ""}${v.toFixed(2)}R`)],
+                    ["Fenster positiv", safe(wf.pct_windows_positive, (v) => `${(v * 100).toFixed(0)}%`)],
+                    ["Avg Sharpe", safe(wf.avg_sharpe, (v) => v.toFixed(2))],
+                    ["Avg Max DD", safe(wf.avg_max_drawdown_pct, (v) => `${v.toFixed(2)}%`)],
+                  ] as [string, string][];
+                })().map(([k, v]) => (
                   <div key={k}>
                     <span style={{ color: "var(--text-dim)" }}>{k}: </span>
                     <b>{v}</b>
@@ -378,22 +438,27 @@ export default function BacktestPage() {
                 ))}
               </div>
               <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
-                {result.walkforward.windows.map((w) => (
-                  <div
-                    key={w.window_idx}
-                    title={`${w.oos_start.slice(0, 10)} → ${w.oos_end.slice(0, 10)} · ${w.n_trades} Trades`}
-                    style={{
-                      background: w.metrics.expectancy_r > 0 ? "rgba(34,197,94,0.15)" : "rgba(239,68,68,0.15)",
-                      border: `1px solid ${w.metrics.expectancy_r > 0 ? "var(--green)" : "var(--red)"}`,
-                      borderRadius: 6,
-                      padding: "5px 10px",
-                      fontSize: 11,
-                      fontWeight: 600,
-                    }}
-                  >
-                    #{w.window_idx + 1} {w.metrics.expectancy_r >= 0 ? "+" : ""}{w.metrics.expectancy_r.toFixed(2)}R
-                  </div>
-                ))}
+                {result.walkforward.windows.map((w) => {
+                  const exp = w.metrics.expectancy_r;
+                  const hasExp = exp !== null && exp !== undefined && isFinite(exp);
+                  const pos = hasExp && exp > 0;
+                  return (
+                    <div
+                      key={w.window_idx}
+                      title={`${w.oos_start.slice(0, 10)} → ${w.oos_end.slice(0, 10)} · ${w.n_trades} Trades`}
+                      style={{
+                        background: pos ? "rgba(34,197,94,0.15)" : "rgba(239,68,68,0.15)",
+                        border: `1px solid ${pos ? "var(--green)" : "var(--red)"}`,
+                        borderRadius: 6,
+                        padding: "5px 10px",
+                        fontSize: 11,
+                        fontWeight: 600,
+                      }}
+                    >
+                      #{w.window_idx + 1} {hasExp ? `${exp >= 0 ? "+" : ""}${exp.toFixed(2)}R` : "—"}
+                    </div>
+                  );
+                })}
               </div>
             </div>
           )}

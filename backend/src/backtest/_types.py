@@ -40,10 +40,10 @@ class BacktestMetrics:
     total_return_pct: float
     avg_win_r: float
     avg_loss_r: float
-    profit_factor: float          # sum(wins) / abs(sum(losses))
+    profit_factor: float | None   # sum(wins) / abs(sum(losses)); None wenn unbestimmt (keine Losses)
     max_drawdown_pct: float
     expectancy_r: float           # avg R-multiple per trade
-    sharpe: float                 # vereinfacht: avg/std × √(bars_per_year) — bars-based
+    sharpe: float | None          # vereinfacht: avg/std × √(bars_per_year); None wenn std==0
     exposure_pct: float           # % der Zeit im Trade
     longs: int
     shorts: int

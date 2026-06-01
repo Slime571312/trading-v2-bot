@@ -20,6 +20,7 @@ backend/data/cache/*.csv
 backend/data/cache/*.parquet
 backend/reports/*.html
 backend/state/*.json
+!backend/state/live_state.json
 
 # Secrets
 .env

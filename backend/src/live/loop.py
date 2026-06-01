@@ -56,8 +56,10 @@ async def run_tick_loop(
     while instance.running:
         tick_count += 1
         tick_start = _now()
+        tick_ok = False
         try:
             await _do_tick(state, instance, state_lock, tick_count)
+            tick_ok = True
         except asyncio.CancelledError:
             log.info("Tick-Loop %s abgebrochen", inst_name)
             raise
@@ -76,6 +78,11 @@ async def run_tick_loop(
 
         async with state_lock:
             instance.last_tick = tick_start
+            # Alten Fehler löschen wenn der Bot wieder sauber durchläuft —
+            # sonst hängt die rote Fehler-Box im UI ewig fest.
+            if tick_ok and instance.last_error is not None:
+                log.info("Tick-Loop %s wieder OK — clearing last_error", inst_name)
+                instance.last_error = None
             save_state(state)
 
         # Push State-Update zum Browser

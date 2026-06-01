@@ -55,7 +55,24 @@ async def lifespan(app: FastAPI):
     )
     await cache.start(instruments=DEFAULT_INSTRUMENTS, refresh_interval_s=60)
     log_app.info("SignalCache Background-Task gestartet")
+
+    async def _gh_actions_sync():
+        """Lädt State alle 60s neu — zeigt GH-Actions-Updates wenn kein lokaler Bot läuft."""
+        import asyncio as _asyncio
+        while True:
+            await _asyncio.sleep(60)
+            orch.reload_from_file()
+
+    sync_task = asyncio.create_task(_gh_actions_sync(), name="gh_state_sync")
+    log_app.info("GitHub-Actions-State-Sync gestartet (60s Intervall)")
+
     yield
+
+    sync_task.cancel()
+    try:
+        await sync_task
+    except asyncio.CancelledError:
+        pass
     await cache.stop()
     await shutdown_orchestrator()
     log_app.info("Backend-Shutdown — Bot + Cache gestoppt, State persistiert")
@@ -307,10 +324,10 @@ class MetricsOut(BaseModel):
     total_return_pct: float
     avg_win_r: float
     avg_loss_r: float
-    profit_factor: float
+    profit_factor: float | None  # None wenn keine Losses → unbestimmt (∞)
     max_drawdown_pct: float
     expectancy_r: float
-    sharpe: float
+    sharpe: float | None          # None wenn std=0 / zu wenig Bars
     exposure_pct: float
     longs: int
     shorts: int
@@ -330,9 +347,9 @@ class WalkForwardOut(BaseModel):
     win_rate: float
     total_return_pct: float
     avg_expectancy_r: float
-    avg_profit_factor: float
+    avg_profit_factor: float | None
     avg_max_drawdown_pct: float
-    avg_sharpe: float
+    avg_sharpe: float | None
     pct_windows_positive: float
     windows: list[WFWindowOut]
 
@@ -398,6 +415,18 @@ async def run_backtest_endpoint(req: BacktestRequest) -> BacktestResponse:
     report_path = render_html(result)
     report_url = f"/reports/{report_path.name}"
 
+    def _safe(v: float | None, d: int = 4) -> float | None:
+        """Null-safe + non-finite-safe round für die optionalen Metriken
+        (profit_factor, sharpe). Bei None oder inf/NaN → None senden statt
+        Pydantic-Crash; JSON-Standard kennt kein Infinity.
+        """
+        if v is None:
+            return None
+        import math as _m
+        if not _m.isfinite(v):
+            return None
+        return round(v, d)
+
     def _metrics(m) -> MetricsOut:
         return MetricsOut(
             total_trades=m.total_trades, wins=m.wins, losses=m.losses,
@@ -405,10 +434,10 @@ async def run_backtest_endpoint(req: BacktestRequest) -> BacktestResponse:
             total_return_pct=round(m.total_return_pct, 4),
             avg_win_r=round(m.avg_win_r, 4),
             avg_loss_r=round(m.avg_loss_r, 4),
-            profit_factor=round(m.profit_factor, 4),
+            profit_factor=_safe(m.profit_factor),
             max_drawdown_pct=round(m.max_drawdown_pct, 4),
             expectancy_r=round(m.expectancy_r, 4),
-            sharpe=round(m.sharpe, 4),
+            sharpe=_safe(m.sharpe),
             exposure_pct=round(m.exposure_pct, 4),
             longs=m.longs, shorts=m.shorts,
         )
@@ -459,9 +488,9 @@ async def run_backtest_endpoint(req: BacktestRequest) -> BacktestResponse:
                 win_rate=round(wfo.win_rate, 4),
                 total_return_pct=round(wfo.total_return_pct, 4),
                 avg_expectancy_r=round(wfo.avg_expectancy_r, 4),
-                avg_profit_factor=round(wfo.avg_profit_factor, 4),
+                avg_profit_factor=_safe(wfo.avg_profit_factor),
                 avg_max_drawdown_pct=round(wfo.avg_max_drawdown_pct, 4),
-                avg_sharpe=round(wfo.avg_sharpe, 4),
+                avg_sharpe=_safe(wfo.avg_sharpe),
                 pct_windows_positive=round(wfo.pct_windows_positive, 4),
                 windows=[
                     WFWindowOut(
@@ -739,6 +768,205 @@ def bot_ticks(instrument: InstrumentName, limit: int = Query(default=50, ge=1, l
     return [TickLogOut(**t.to_json()) for t in reversed(inst.tick_log[-limit:])]
 
 
+# ─── Hot-Reload Config (Bot läuft weiter) ────────────────────────────────
+
+
+class BotConfigPatch(BaseModel):
+    """Param-Update an einer laufenden Instanz — Bot wird NICHT gestoppt.
+
+    Alle Felder optional, nur gesetzte werden übernommen.
+    """
+    rr_threshold: float | None = Field(default=None, ge=1.0, le=5.0)
+    risk_pct: float | None = Field(default=None, ge=0.001, le=0.05)
+    sweep_lookback: int | None = Field(default=None, ge=3, le=50)
+    tick_interval_s: int | None = Field(default=None, ge=10, le=600)
+
+
+@app.patch("/bot/{instrument}/config", response_model=BotInstanceResponse)
+async def bot_patch_config(instrument: InstrumentName, patch: BotConfigPatch) -> BotInstanceResponse:
+    """Live-Param-Update — keine Stop/Restart-Zwang.
+
+    Der Tick-Loop liest `instance.rr_threshold`, `risk_pct`, `sweep_lookback`,
+    `tick_interval_s` bei jedem Tick frisch aus der Instance. Wir mutieren
+    direkt das Objekt, der nächste Tick verwendet die neuen Werte.
+    """
+    orch = get_orchestrator()
+    diff = {k: v for k, v in patch.model_dump().items() if v is not None}
+    if not diff:
+        raise HTTPException(400, "Mindestens ein Feld muss gesetzt sein")
+    try:
+        inst = await orch.apply_config_diff(instrument, diff)
+    except KeyError as e:
+        raise HTTPException(400, str(e))
+    await ws_hub.push_to_dashboard({
+        "type": "instance_update", "instrument": instrument,
+        "instance": inst.to_json(),
+    })
+    return _instance_to_response(inst)
+
+
+# ─── Bot-Detail Statistiken ──────────────────────────────────────────────
+
+
+class BotStatsResponse(BaseModel):
+    """Detail-Stats für eine Bot-Instanz — beim Aufklappen einer BotCard.
+
+    Equity-Verlauf wird aus closed_trades rekonstruiert (Cumsum pro Trade).
+    """
+    instrument: str
+    running: bool
+    initial_capital: float
+    equity: float
+    pnl_abs: float
+    pnl_pct: float
+    n_open: int
+    n_closed: int
+    wins: int
+    losses: int
+    win_rate: float | None  # None wenn keine geschlossenen Trades
+    avg_r: float | None
+    best_r: float | None
+    worst_r: float | None
+    expectancy_r: float | None  # avg_win_r * win_rate + avg_loss_r * loss_rate
+    avg_win_r: float | None
+    avg_loss_r: float | None
+    longs: int
+    shorts: int
+    sl_exits: int
+    tp_exits: int
+    manual_exits: int
+    avg_hold_minutes: float | None
+    last_trade_time: str | None
+    equity_curve: list[dict]  # [{time, equity, pnl_cum}, ...]
+    variant_breakdown: dict[str, dict]  # variant → {n, win_rate, avg_r}
+    last_error: str | None
+    last_tick: str | None
+    last_signal_check: str | None
+    tick_interval_s: int
+    rr_threshold: float
+    risk_pct: float
+    sweep_lookback: int
+
+
+def _compute_stats(inst) -> BotStatsResponse:
+    closed = inst.closed_trades
+    pnl_abs = round(inst.equity - inst.initial_capital, 2)
+    pnl_pct = round((pnl_abs / inst.initial_capital) * 100, 3) if inst.initial_capital else 0.0
+    n_closed = len(closed)
+
+    wins_list = [t for t in closed if t.r_multiple > 0]
+    losses_list = [t for t in closed if t.r_multiple <= 0]
+    n_wins, n_losses = len(wins_list), len(losses_list)
+
+    win_rate = (n_wins / n_closed) if n_closed else None
+    rs = [t.r_multiple for t in closed]
+    avg_r = sum(rs) / n_closed if n_closed else None
+    best_r = max(rs) if rs else None
+    worst_r = min(rs) if rs else None
+    avg_win_r = (sum(t.r_multiple for t in wins_list) / n_wins) if n_wins else None
+    avg_loss_r = (sum(t.r_multiple for t in losses_list) / n_losses) if n_losses else None
+    expectancy_r = None
+    if win_rate is not None and avg_win_r is not None and avg_loss_r is not None:
+        expectancy_r = avg_win_r * win_rate + avg_loss_r * (1 - win_rate)
+    elif win_rate is not None and avg_win_r is not None:
+        expectancy_r = avg_win_r * win_rate
+    elif win_rate is not None and avg_loss_r is not None:
+        expectancy_r = avg_loss_r * (1 - win_rate)
+
+    longs = sum(1 for t in closed if t.side == "long")
+    shorts = sum(1 for t in closed if t.side == "short")
+    sl_exits = sum(1 for t in closed if t.exit_reason == "sl")
+    tp_exits = sum(1 for t in closed if t.exit_reason == "tp")
+    manual_exits = sum(1 for t in closed if t.exit_reason in ("manual", "bot_stopped"))
+
+    hold_minutes = [
+        (t.close_time - t.open_time).total_seconds() / 60.0
+        for t in closed if t.close_time and t.open_time
+    ]
+    avg_hold = sum(hold_minutes) / len(hold_minutes) if hold_minutes else None
+
+    last_trade_time = (closed[-1].close_time.isoformat() if closed and closed[-1].close_time else None)
+
+    # Equity-Kurve aus geschlossenen Trades aufbauen (chronologisch)
+    sorted_closed = sorted(closed, key=lambda t: t.close_time)
+    eq = inst.initial_capital
+    curve = [{
+        "time": (inst.started_at.isoformat() if inst.started_at else None),
+        "equity": round(eq, 2),
+        "pnl_cum": 0.0,
+    }]
+    cum_pnl = 0.0
+    for t in sorted_closed:
+        eq += t.pnl_abs
+        cum_pnl += t.pnl_abs
+        curve.append({
+            "time": t.close_time.isoformat(),
+            "equity": round(eq, 2),
+            "pnl_cum": round(cum_pnl, 2),
+        })
+
+    # Pro Variant aufschlüsseln
+    variants: dict[str, dict] = {}
+    for t in closed:
+        v = variants.setdefault(t.variant, {"n": 0, "wins": 0, "sum_r": 0.0})
+        v["n"] += 1
+        if t.r_multiple > 0:
+            v["wins"] += 1
+        v["sum_r"] += t.r_multiple
+    variant_breakdown = {
+        name: {
+            "n": v["n"],
+            "win_rate": round(v["wins"] / v["n"], 3) if v["n"] else None,
+            "avg_r": round(v["sum_r"] / v["n"], 3) if v["n"] else None,
+        }
+        for name, v in variants.items()
+    }
+
+    return BotStatsResponse(
+        instrument=inst.instrument,
+        running=inst.running,
+        initial_capital=inst.initial_capital,
+        equity=round(inst.equity, 2),
+        pnl_abs=pnl_abs,
+        pnl_pct=pnl_pct,
+        n_open=len(inst.open_trades),
+        n_closed=n_closed,
+        wins=n_wins,
+        losses=n_losses,
+        win_rate=round(win_rate, 3) if win_rate is not None else None,
+        avg_r=round(avg_r, 3) if avg_r is not None else None,
+        best_r=round(best_r, 3) if best_r is not None else None,
+        worst_r=round(worst_r, 3) if worst_r is not None else None,
+        expectancy_r=round(expectancy_r, 3) if expectancy_r is not None else None,
+        avg_win_r=round(avg_win_r, 3) if avg_win_r is not None else None,
+        avg_loss_r=round(avg_loss_r, 3) if avg_loss_r is not None else None,
+        longs=longs,
+        shorts=shorts,
+        sl_exits=sl_exits,
+        tp_exits=tp_exits,
+        manual_exits=manual_exits,
+        avg_hold_minutes=round(avg_hold, 1) if avg_hold is not None else None,
+        last_trade_time=last_trade_time,
+        equity_curve=curve,
+        variant_breakdown=variant_breakdown,
+        last_error=inst.last_error,
+        last_tick=inst.last_tick.isoformat() if inst.last_tick else None,
+        last_signal_check=inst.last_signal_check.isoformat() if inst.last_signal_check else None,
+        tick_interval_s=inst.tick_interval_s,
+        rr_threshold=inst.rr_threshold,
+        risk_pct=inst.risk_pct,
+        sweep_lookback=inst.sweep_lookback,
+    )
+
+
+@app.get("/bot/{instrument}/stats", response_model=BotStatsResponse)
+def bot_stats(instrument: InstrumentName) -> BotStatsResponse:
+    """Detail-Statistiken einer Instanz — für die aufgeklappte Bot-Card."""
+    orch = get_orchestrator()
+    inst = orch.state.ensure(instrument)
+    return _compute_stats(inst)
+
+
 @app.post("/bot/start-all", response_model=BotOverviewResponse)
 async def bot_start_all(req: StartAllRequest) -> BotOverviewResponse:
     orch = get_orchestrator()
@@ -761,6 +989,25 @@ async def bot_stop_all() -> BotOverviewResponse:
     orch = get_orchestrator()
     await orch.stop_all()
     return bot_instances()
+
+
+@app.post("/bot/sync")
+async def bot_sync_from_github() -> dict:
+    """Lädt live_state.json sofort neu — holt GH-Actions-Updates ohne Server-Neustart.
+
+    Nur wirksam wenn keine Bots lokal laufen (sonst würde laufender State überschrieben).
+    """
+    orch = get_orchestrator()
+    was_running = orch.any_running()
+    if not was_running:
+        orch.reload_from_file()
+    return {
+        "synced": not was_running,
+        "message": (
+            "State neu geladen" if not was_running
+            else "Übersprungen — lokale Bots laufen noch"
+        ),
+    }
 
 
 @app.websocket("/ws/live")

@@ -120,19 +120,37 @@ async def request(
     json_body: dict[str, Any] | None = None,
     retry_on_401: bool = True,
     max_429_retries: int = 4,
+    max_network_retries: int = 3,
 ) -> httpx.Response:
-    """Authentifizierter Capital-Call mit automatischem 401- und 429-Retry.
+    """Authentifizierter Capital-Call mit automatischem 401-, 429- und Netz-Retry.
 
     `path` ist relativ zur Base-URL (z.B. `/prices/BTCUSD`).
     Capital rate-limitiert auf ~10 req/s — bei 429 wird mit exponentiellem
     Backoff (0.5/1/2/4 s) bis zu `max_429_retries`-mal wiederholt.
+
+    Transiente Netz-Fehler (DNS-Aussetzer, Connection-Reset, Read-Timeout)
+    werden bis `max_network_retries`-mal mit Backoff 1/2/4 s wiederholt —
+    der Bot bleibt dadurch über kurze WiFi-/DNS-Hiccups stabil.
     """
     session = await get_session(client)
     url = f"{config.capital_base_url}{path}"
 
+    res: httpx.Response | None = None
+    network_attempt = 0
     for attempt in range(max_429_retries + 1):
-        res = await client.request(method, url, headers=_auth_headers(session),
-                                   params=params, json=json_body)
+        try:
+            res = await client.request(method, url, headers=_auth_headers(session),
+                                       params=params, json=json_body)
+        except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError,
+                httpx.ConnectTimeout, httpx.WriteTimeout) as e:
+            if network_attempt >= max_network_retries:
+                raise CapitalAPIError(599, f"Netzwerk-Fehler nach {network_attempt+1} Versuchen: {e}")
+            wait = 1.0 * (2 ** network_attempt)
+            log.warning("Netz-Fehler bei %s %s (%s) — retry in %.1fs (%d/%d)",
+                        method, path, e, wait, network_attempt + 1, max_network_retries)
+            await asyncio.sleep(wait)
+            network_attempt += 1
+            continue
         if res.status_code == 401 and retry_on_401:
             log.warning("401 von Capital → Session refresh + retry %s %s", method, path)
             invalidate_session()
@@ -146,6 +164,8 @@ async def request(
             continue
         break
 
+    if res is None:
+        raise CapitalAPIError(599, "Kein Response — alle Netz-Retries fehlgeschlagen")
     if res.status_code >= 400:
         raise CapitalAPIError(res.status_code, res.text)
     return res

@@ -280,9 +280,12 @@ async def _impl_run_backtest(args: dict[str, Any]) -> dict:
             "win_rate": round(m.win_rate, 4),
             "total_return_pct": round(m.total_return_pct, 2),
             "max_drawdown_pct": round(m.max_drawdown_pct, 2),
-            "sharpe": round(m.sharpe, 2),
+            "sharpe": round(m.sharpe, 2) if m.sharpe is not None else None,
             "expectancy_r": round(m.expectancy_r, 3),
-            "profit_factor": round(m.profit_factor, 2) if m.profit_factor != float("inf") else "inf",
+            "profit_factor": (
+                round(m.profit_factor, 2) if m.profit_factor is not None
+                else ("inf" if m.wins > 0 else None)
+            ),
             "avg_win_r": round(m.avg_win_r, 2),
             "avg_loss_r": round(m.avg_loss_r, 2),
             "longs": m.longs, "shorts": m.shorts,

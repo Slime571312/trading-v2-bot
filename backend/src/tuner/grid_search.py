@@ -151,7 +151,14 @@ async def _run_single(
         iter_tf=iter_tf,
     )
     m = result.metrics
-    pf = m.profit_factor if m.profit_factor != float("inf") else 999.0
+    # profit_factor / sharpe können None sein (siehe metrics.py). Für Score-Berechnung
+    # behandle None als „unbestimmt sehr gut" (999) wenn wins>0 sonst 0; im Output
+    # nehmen wir 0.0 als Stellvertreter weil GridCombo schon ein dataclass-float ist.
+    if m.profit_factor is None:
+        pf = 999.0 if m.wins > 0 else 0.0
+    else:
+        pf = m.profit_factor
+    sharpe_val = m.sharpe if m.sharpe is not None else 0.0
     return GridCombo(
         rr_threshold=rr_threshold,
         sweep_lookback=sweep_lookback,
@@ -161,7 +168,7 @@ async def _run_single(
         profit_factor=round(pf, 3),
         total_return_pct=round(m.total_return_pct, 3),
         max_drawdown_pct=round(m.max_drawdown_pct, 3),
-        sharpe=round(m.sharpe, 3),
+        sharpe=round(sharpe_val, 3),
         score=round(_score(m.total_trades, m.expectancy_r, pf), 4),
     )
 

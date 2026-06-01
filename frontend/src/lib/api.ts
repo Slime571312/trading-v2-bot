@@ -32,10 +32,11 @@ export interface MetricsOut {
   total_return_pct: number;
   avg_win_r: number;
   avg_loss_r: number;
-  profit_factor: number;
+  // Pydantic v2 serialisiert float('inf')/NaN als null — also überall optional.
+  profit_factor: number | null;
   max_drawdown_pct: number;
   expectancy_r: number;
-  sharpe: number;
+  sharpe: number | null;
   exposure_pct: number;
   longs: number;
   shorts: number;
@@ -127,6 +128,34 @@ export async function fetchSignal(instrument: Instrument): Promise<SignalRespons
   return res.json();
 }
 
+export interface Candle {
+  time: string;
+  open: number;
+  high: number;
+  low: number;
+  close: number;
+  volume: number;
+}
+
+export interface CandlesResponse {
+  instrument: string;
+  epic: string;
+  tf: string;
+  resolution: string;
+  count: number;
+  candles: Candle[];
+}
+
+export async function fetchCandles(
+  instrument: Instrument,
+  tf: Timeframe,
+  bars = 100,
+): Promise<CandlesResponse> {
+  const res = await fetch(`${BASE}/data/${instrument}?tf=${tf}&bars=${bars}`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`data/${instrument}?tf=${tf} ${res.status}`);
+  return res.json();
+}
+
 export async function runBacktest(req: BacktestRequest): Promise<BacktestResponse> {
   const res = await fetch(`${BASE}/backtest`, {
     method: "POST",
@@ -135,7 +164,21 @@ export async function runBacktest(req: BacktestRequest): Promise<BacktestRespons
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ detail: res.statusText }));
-    throw new Error(err.detail ?? `backtest ${res.status}`);
+    // FastAPI 422 liefert ein Array von Validation-Errors:
+    //   {detail: [{loc: ["body", "bars"], msg: "Input should be >= 200", type: "..."}, ...]}
+    // FastAPI 4xx/5xx mit Custom-Handler liefert {detail: "Klartext"}.
+    let msg: string;
+    if (Array.isArray(err.detail)) {
+      msg = err.detail.map((e: { loc?: string[]; msg?: string }) => {
+        const field = Array.isArray(e.loc) ? e.loc.slice(1).join(".") : "?";
+        return `${field}: ${e.msg ?? "invalid"}`;
+      }).join(" · ");
+    } else if (typeof err.detail === "string") {
+      msg = err.detail;
+    } else {
+      msg = `backtest ${res.status}`;
+    }
+    throw new Error(msg);
   }
   return res.json();
 }
@@ -270,6 +313,83 @@ export async function stopAllBots(): Promise<BotOverview> {
 export async function fetchTickLog(instrument: Instrument, limit = 50): Promise<TickLogEntry[]> {
   const res = await fetch(`${BASE}/bot/${instrument}/ticks?limit=${limit}`, { cache: "no-store" });
   if (!res.ok) throw new Error(`bot/${instrument}/ticks ${res.status}`);
+  return res.json();
+}
+
+// ─── Bot-Detail-Stats + Hot-Reload-Config ──────────────────────────────
+
+export interface EquityCurvePoint {
+  time: string | null;
+  equity: number;
+  pnl_cum: number;
+}
+
+export interface VariantStats {
+  n: number;
+  win_rate: number | null;
+  avg_r: number | null;
+}
+
+export interface BotStats {
+  instrument: string;
+  running: boolean;
+  initial_capital: number;
+  equity: number;
+  pnl_abs: number;
+  pnl_pct: number;
+  n_open: number;
+  n_closed: number;
+  wins: number;
+  losses: number;
+  win_rate: number | null;
+  avg_r: number | null;
+  best_r: number | null;
+  worst_r: number | null;
+  expectancy_r: number | null;
+  avg_win_r: number | null;
+  avg_loss_r: number | null;
+  longs: number;
+  shorts: number;
+  sl_exits: number;
+  tp_exits: number;
+  manual_exits: number;
+  avg_hold_minutes: number | null;
+  last_trade_time: string | null;
+  equity_curve: EquityCurvePoint[];
+  variant_breakdown: Record<string, VariantStats>;
+  last_error: string | null;
+  last_tick: string | null;
+  last_signal_check: string | null;
+  tick_interval_s: number;
+  rr_threshold: number;
+  risk_pct: number;
+  sweep_lookback: number;
+}
+
+export async function fetchBotStats(instrument: Instrument): Promise<BotStats> {
+  const res = await fetch(`${BASE}/bot/${instrument}/stats`, { cache: "no-store" });
+  if (!res.ok) throw new Error(`bot/${instrument}/stats ${res.status}`);
+  return res.json();
+}
+
+export interface BotConfigPatch {
+  rr_threshold?: number;
+  risk_pct?: number;
+  sweep_lookback?: number;
+  tick_interval_s?: number;
+}
+
+/** PATCH /bot/{instrument}/config — Hot-Reload, Bot läuft weiter. */
+export async function patchBotConfig(instrument: Instrument, patch: BotConfigPatch): Promise<BotInstance> {
+  const res = await fetch(`${BASE}/bot/${instrument}/config`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) {
+    const txt = await res.text().catch(() => "");
+    throw new Error(`bot/${instrument}/config ${res.status}${txt ? `: ${txt}` : ""}`);
+  }
   return res.json();
 }
 

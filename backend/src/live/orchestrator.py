@@ -155,6 +155,18 @@ class BotOrchestrator:
         log.info("Bot %s zurückgesetzt", instrument)
         return inst
 
+    # ── GitHub Actions Sync ─────────────────────────────────────────
+    def reload_from_file(self) -> None:
+        """Lädt live_state.json neu — nur wenn keine Bots lokal laufen.
+
+        Wird vom Background-Task aufgerufen um GH-Actions-Updates zu sehen
+        ohne den lokalen Server neu zu starten.
+        """
+        if self.any_running():
+            return  # lokale Bots aktiv — nicht überschreiben
+        self.state = load_state()
+        log.debug("State aus Datei neu geladen (GH Actions Sync)")
+
     # ── Config-Mutation (für Chat-Proposals) ────────────────────────
     async def apply_config_diff(self, instrument: str, diff: dict) -> BotInstance:
         """Wendet einen Param-Diff auf eine Instance an. Atomic + persistiert."""

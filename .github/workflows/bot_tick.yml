@@ -1,0 +1,52 @@
+name: Bot Tick
+
+on:
+  schedule:
+    - cron: '*/5 * * * *'   # alle 5 Minuten
+  workflow_dispatch:          # manuell über GitHub UI triggerbar
+
+# Nur ein Tick gleichzeitig — kein zweiter startet während der erste läuft
+concurrency:
+  group: bot-tick
+  cancel-in-progress: false
+
+permissions:
+  contents: write   # für git push
+
+jobs:
+  tick:
+    runs-on: ubuntu-latest
+    timeout-minutes: 4   # stirbt bevor der nächste 5-Min-Tick startet
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Python Setup
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+          cache-dependency-path: backend/requirements-bot.txt
+
+      - name: Dependencies installieren
+        run: pip install -r backend/requirements-bot.txt
+
+      - name: Bot Tick ausführen
+        env:
+          CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
+          CAPITAL_EMAIL: ${{ secrets.CAPITAL_EMAIL }}
+          CAPITAL_API_PASSWORD: ${{ secrets.CAPITAL_API_PASSWORD }}
+          CACHE_DIR: /tmp/bot_cache
+          PYTHONPATH: backend
+        run: python -m src.live.gh_runner
+
+      - name: State committen
+        run: |
+          git config user.name "Trading Bot"
+          git config user.email "bot@users.noreply.github.com"
+          git add -f backend/state/live_state.json
+          git diff --staged --quiet || git commit -m "bot: tick $(date -u +'%Y-%m-%d %H:%M') UTC [skip ci]"
+          git push
