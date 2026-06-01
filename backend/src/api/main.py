@@ -5,6 +5,7 @@ Spätere Etappen ergänzen /backtest, /bot, /chat, /trades, /tuner, /ws.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -58,11 +59,10 @@ async def lifespan(app: FastAPI):
 
     async def _gh_actions_sync():
         """Alle 60s: git pull → live_state.json neu lesen → Dashboard aktuell."""
-        import asyncio as _asyncio
         import subprocess
         repo_root = Path(__file__).resolve().parents[3]
         while True:
-            await _asyncio.sleep(60)
+            await asyncio.sleep(60)
             if not orch.any_running():
                 try:
                     proc = subprocess.run(

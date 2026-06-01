@@ -823,9 +823,28 @@ function AllClosedTrades({ instances }: { instances: BotInstance[] }) {
 
 // ─── Main Page ──────────────────────────────────────────────────────────
 
+const GITHUB_STATE_URL =
+  "https://raw.githubusercontent.com/Slime571312/trading-v2-bot/main/backend/state/live_state.json";
+
+async function fetchGithubState(): Promise<BotOverview | null> {
+  try {
+    const r = await fetch(GITHUB_STATE_URL + "?t=" + Date.now());
+    if (!r.ok) return null;
+    const data = await r.json();
+    const instances: BotInstance[] = Object.values(data.instances ?? {}) as BotInstance[];
+    return {
+      instances,
+      total_equity: instances.reduce((s: number, i: BotInstance) => s + i.equity, 0),
+      any_running: instances.some((i: BotInstance) => i.running),
+      n_ws_clients: 0,
+    };
+  } catch { return null; }
+}
+
 export default function LivePage() {
   const { instances: liveInstances, status: wsStatus } = useLiveFeed();
   const [fallback, setFallback] = useState<BotOverview | null>(null);
+  const [backendOnline, setBackendOnline] = useState(true);
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [tickModalFor, setTickModalFor] = useState<Instrument | null>(null);
@@ -835,7 +854,12 @@ export default function LivePage() {
     try {
       const o = await fetchBotOverview();
       setFallback(o);
-    } catch {}
+      setBackendOnline(true);
+    } catch {
+      setBackendOnline(false);
+      const gh = await fetchGithubState();
+      if (gh) setFallback(gh);
+    }
   }
 
   useEffect(() => {
@@ -884,7 +908,7 @@ export default function LivePage() {
   }
 
   if (instances.length === 0) {
-    return <p style={{ color: "var(--text-dim)" }}>Lade Bot-Status... (Backend offline?)</p>;
+    return <p style={{ color: "var(--text-dim)" }}>Lade Bot-Status von GitHub...</p>;
   }
 
   return (
@@ -930,6 +954,11 @@ export default function LivePage() {
         </div>
       </div>
 
+      {!backendOnline && (
+        <div style={{ background: "rgba(251,191,36,0.1)", border: "1px solid #f59e0b", color: "#f59e0b", padding: "8px 12px", borderRadius: 6, fontSize: 12, marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}>
+          <span>⚡ GitHub-Modus — Backend offline, zeige letzten Stand von GitHub (alle 15s aktualisiert)</span>
+        </div>
+      )}
       {err && (
         <div style={{ background: "rgba(239,68,68,0.1)", border: "1px solid var(--red)", color: "var(--red)", padding: "8px 12px", borderRadius: 6, fontSize: 12, marginBottom: 12 }}>
           {err}
