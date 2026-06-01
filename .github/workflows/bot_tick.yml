@@ -36,9 +36,9 @@ jobs:
 
       - name: Bot Tick ausführen
         env:
-          CAPITAL_API_KEY: ${{ secrets.CAPITAL_API_KEY }}
-          CAPITAL_EMAIL: ${{ secrets.CAPITAL_EMAIL }}
-          CAPITAL_API_PASSWORD: ${{ secrets.CAPITAL_API_PASSWORD }}
+          CAPITAL_API_KEY: ${{ secrets.CAPITALAPIKEY }}
+          CAPITAL_EMAIL: ${{ secrets.CAPITALEMAIL }}
+          CAPITAL_API_PASSWORD: ${{ secrets.CAPITALAPIPASSWORT }}
           CACHE_DIR: /tmp/bot_cache
           PYTHONPATH: backend
         run: python -m src.live.gh_runner
