@@ -6,7 +6,7 @@
       "running": false,
       "started_at": "2026-05-31T15:52:16.559322+00:00",
       "stopped_at": "2026-05-31T22:40:10.307470+00:00",
-      "last_tick": "2026-06-01T11:02:14.177381+00:00",
+      "last_tick": "2026-06-01T11:03:21.452907+00:00",
       "last_signal_check": "2026-05-31T22:38:05.835911+00:00",
       "tick_interval_s": 60,
       "initial_capital": 10000.0,
@@ -602,6 +602,21 @@
           "variant": null,
           "detail": "have: []",
           "related_trade_id": null
+        },
+        {
+          "timestamp": "2026-06-01T11:03:21.452818+00:00",
+          "action": "eval",
+          "decision": "no_setup",
+          "bias": "long",
+          "htf_used": null,
+          "ltf_used": null,
+          "sweep_time": null,
+          "sweep_direction": null,
+          "bos_time": null,
+          "rr_computed": null,
+          "variant": null,
+          "detail": "kein HTF-Sweep + LTF-BOS im Lookback",
+          "related_trade_id": null
         }
       ]
     },
@@ -610,7 +625,7 @@
       "running": false,
       "started_at": "2026-05-31T15:52:16.561156+00:00",
       "stopped_at": "2026-05-31T22:40:10.319443+00:00",
-      "last_tick": "2026-06-01T11:02:14.269422+00:00",
+      "last_tick": "2026-06-01T11:03:24.781348+00:00",
       "last_signal_check": "2026-05-31T22:38:05.644177+00:00",
       "tick_interval_s": 60,
       "initial_capital": 10000.0,
@@ -1206,6 +1221,21 @@
           "variant": null,
           "detail": "have: []",
           "related_trade_id": null
+        },
+        {
+          "timestamp": "2026-06-01T11:03:24.781280+00:00",
+          "action": "eval",
+          "decision": "no_setup",
+          "bias": "long",
+          "htf_used": null,
+          "ltf_used": null,
+          "sweep_time": null,
+          "sweep_direction": null,
+          "bos_time": null,
+          "rr_computed": null,
+          "variant": null,
+          "detail": "kein HTF-Sweep + LTF-BOS im Lookback",
+          "related_trade_id": null
         }
       ]
     },
@@ -1214,7 +1244,7 @@
       "running": false,
       "started_at": "2026-05-31T15:52:16.562819+00:00",
       "stopped_at": "2026-05-31T22:40:10.329096+00:00",
-      "last_tick": "2026-06-01T11:02:14.360493+00:00",
+      "last_tick": "2026-06-01T11:03:27.920235+00:00",
       "last_signal_check": "2026-05-31T22:38:05.683823+00:00",
       "tick_interval_s": 60,
       "initial_capital": 10000.0,
@@ -1825,6 +1855,21 @@
           "variant": null,
           "detail": "have: []",
           "related_trade_id": null
+        },
+        {
+          "timestamp": "2026-06-01T11:03:27.920168+00:00",
+          "action": "eval",
+          "decision": "no_setup",
+          "bias": "long",
+          "htf_used": null,
+          "ltf_used": null,
+          "sweep_time": null,
+          "sweep_direction": null,
+          "bos_time": null,
+          "rr_computed": null,
+          "variant": null,
+          "detail": "kein HTF-Sweep + LTF-BOS im Lookback",
+          "related_trade_id": null
         }
       ]
     },
@@ -1833,7 +1878,7 @@
       "running": false,
       "started_at": "2026-05-31T15:52:16.564445+00:00",
       "stopped_at": "2026-05-31T22:40:10.337547+00:00",
-      "last_tick": "2026-06-01T11:02:14.373714+00:00",
+      "last_tick": "2026-06-01T11:03:28.216891+00:00",
       "last_signal_check": "2026-05-31T22:39:16.817605+00:00",
       "tick_interval_s": 10,
       "initial_capital": 10000.0,
@@ -4487,6 +4532,21 @@
         },
         {
           "timestamp": "2026-06-01T11:02:14.373703+00:00",
+          "action": "skip",
+          "decision": "already_in_position",
+          "bias": null,
+          "htf_used": null,
+          "ltf_used": null,
+          "sweep_time": null,
+          "sweep_direction": null,
+          "bos_time": null,
+          "rr_computed": null,
+          "variant": null,
+          "detail": "open: 82fdaf80ae18",
+          "related_trade_id": null
+        },
+        {
+          "timestamp": "2026-06-01T11:03:28.216872+00:00",
           "action": "skip",
           "decision": "already_in_position",
           "bias": null,
