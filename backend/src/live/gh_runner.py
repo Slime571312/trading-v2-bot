@@ -160,14 +160,16 @@ async def _tick(instance: BotInstance) -> None:
         log.warning("%s Capital-Fehler: %s", inst, e)
 
 
-async def main() -> None:
-    log.info("=== GitHub Actions Tick gestartet ===")
-    state = load_state()
+LOOP_DURATION_S = 270   # 4:30 Min Loop — Cron feuert alle 5 Min → nahtlos
+TICK_INTERVAL_S = 30    # alle 30s ein Tick für alle Instrumente
 
+
+async def _tick_all(state: BotState) -> bool:
+    """Ein Tick für alle Instrumente. Gibt True zurück wenn State geändert."""
+    changed = False
     for instrument in INSTRUMENTS:
         instance = state.ensure(instrument)
-        log.info("--- %s  equity=%.2f  open=%d ---",
-                 instrument, instance.equity, len(instance.open_trades))
+        open_before = len(instance.open_trades)
         try:
             await _tick(instance)
             instance.last_tick = _now()
@@ -176,13 +178,46 @@ async def main() -> None:
         except Exception as e:
             log.exception("Tick %s gecrasht: %s", instrument, e)
             instance.last_error = f"{type(e).__name__}: {e}"
+        if len(instance.open_trades) != open_before:
+            changed = True
+    return changed
 
-    save_state(state)
 
-    log.info("=== Zusammenfassung ===")
+async def main() -> None:
+    import time
+    log.info("=== GH Actions Bot-Loop gestartet (%.0fs, Tick alle %ds) ===",
+             LOOP_DURATION_S, TICK_INTERVAL_S)
+    state = load_state()
+    deadline = time.monotonic() + LOOP_DURATION_S
+    tick_num = 0
+
+    while time.monotonic() < deadline:
+        tick_start = time.monotonic()
+        tick_num += 1
+        log.info("── Tick #%d ──", tick_num)
+
+        changed = await _tick_all(state)
+
+        # State immer speichern (wird am Ende committed)
+        save_state(state)
+
+        if changed:
+            log.info("Trade-Event — State persistiert")
+            for name, inst in state.instances.items():
+                info = f"OPEN {inst.open_trades[0].side}" if inst.open_trades else "flat"
+                log.info("  %-8s equity=%8.2f  %s", name, inst.equity, info)
+
+        elapsed = time.monotonic() - tick_start
+        sleep = max(1.0, TICK_INTERVAL_S - elapsed)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        await asyncio.sleep(min(sleep, remaining))
+
+    log.info("=== Loop beendet — Zusammenfassung ===")
     for name, inst in state.instances.items():
-        trade_info = f"OPEN {inst.open_trades[0].side}" if inst.open_trades else "flat"
-        log.info("  %-8s equity=%8.2f  %s", name, inst.equity, trade_info)
+        info = f"OPEN {inst.open_trades[0].side}" if inst.open_trades else "flat"
+        log.info("  %-8s equity=%8.2f  %s", name, inst.equity, info)
 
 
 if __name__ == "__main__":

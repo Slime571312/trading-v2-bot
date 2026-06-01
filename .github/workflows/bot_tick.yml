@@ -16,7 +16,7 @@ permissions:
 jobs:
   tick:
     runs-on: ubuntu-latest
-    timeout-minutes: 4   # stirbt bevor der nächste 5-Min-Tick startet
+    timeout-minutes: 5   # Loop läuft 4:30 Min, dann nahtlos nächster Cron
 
     steps:
       - name: Checkout
