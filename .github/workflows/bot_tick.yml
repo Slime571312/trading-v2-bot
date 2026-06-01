@@ -35,7 +35,10 @@ jobs:
         run: pip install -r backend/requirements-bot.txt
 
       - name: Credentials laden
-        run: echo "${{ secrets.BOT }}" > backend/.env
+        run: |
+          echo "${{ secrets.BOT }}" > backend/.env
+          echo "=== Keys in .env (keine Werte) ==="
+          grep -o '^[^=:]*' backend/.env || echo "(kein KEY=VALUE Format erkannt)"
 
       - name: Bot Tick ausführen
         env:
