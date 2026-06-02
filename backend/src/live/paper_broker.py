@@ -93,13 +93,44 @@ def check_intrabar_exit(
     return None
 
 
+def scan_exit_over_bars(
+    trade: OpenTrade,
+    bars: pd.DataFrame,
+) -> tuple[pd.Series, float, ExitReason] | None:
+    """Scannt eine Reihe von Bars chronologisch auf erstes SL/TP-Hit.
+
+    Gibt (hit_bar, exit_price_raw, reason, bar_timestamp) zurück, oder None.
+    Gedacht für Catch-up nach Offline-Phase: alle 1m-Bars seit Trade-Öffnung
+    in Reihenfolge prüfen, nicht nur die letzte.
+    """
+    bars_after = bars[bars.index > trade.open_time]
+    for ts, bar in bars_after.iterrows():
+        result = check_intrabar_exit(trade, bar)
+        if result is not None:
+            exit_price, reason = result
+            return bar, exit_price, reason, ts
+    return None
+
+
 def close_position(
     trade: OpenTrade,
     exit_price_raw: float,
     current_bar: pd.Series,
     reason: ExitReason,
+    close_time=None,
 ) -> ClosedTrade:
-    """Closed-Trade aus Open-Trade + Exit-Bar. PnL + R-Multiple berechnen."""
+    """Closed-Trade aus Open-Trade + Exit-Bar. PnL + R-Multiple berechnen.
+
+    `close_time`: optionaler expliziter Schließzeitpunkt (für Catch-up nach
+    Offline-Phase). Wenn None, wird _now() verwendet.
+    """
+    from datetime import datetime
+    if close_time is None:
+        close_time = _now()
+    elif isinstance(close_time, pd.Timestamp):
+        from datetime import timezone
+        close_time = close_time.to_pydatetime().replace(tzinfo=timezone.utc) if close_time.tzinfo is None else close_time.to_pydatetime()
+
     exit_slipped = apply_slippage_exit(
         exit_price_raw, trade.side,
         float(current_bar.high), float(current_bar.low),
@@ -113,7 +144,7 @@ def close_position(
 
     return ClosedTrade(
         id=trade.id, instrument=trade.instrument, side=trade.side,
-        open_time=trade.open_time, close_time=_now(),
+        open_time=trade.open_time, close_time=close_time,
         entry=trade.entry, exit=exit_slipped,
         sl=trade.sl, tp=trade.tp, size=trade.size,
         variant=trade.variant, htf_used=trade.htf_used, ltf_used=trade.ltf_used,

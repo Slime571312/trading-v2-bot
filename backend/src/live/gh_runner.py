@@ -40,38 +40,50 @@ async def _tick(instance: BotInstance) -> None:
     """Vollständiger Tick für ein Instrument: SL/TP-Check + Signal-Eval."""
     inst = instance.instrument
 
-    # 1. 1m-Bar für Intrabar-Check
+    # 1. 1m-Bars laden — genug um seit Trade-Öffnung alles abzudecken (Catch-up)
+    df_1m = pd.DataFrame()
     latest_bar = None
     try:
-        df_1m = await load_candles(inst, "1m", bars=20)
+        # Wie viele 1m-Bars seit dem ältesten offenen Trade?
+        bars_needed = 500  # ~8h Default
+        if instance.open_trades:
+            from datetime import timezone
+            import math
+            oldest = min(t.open_time for t in instance.open_trades)
+            # Sekunden seit Trade-Öffnung + 10% Puffer, in Bars (1 Bar = 1 Min)
+            now_utc = _now()
+            age_s = (now_utc - oldest).total_seconds()
+            bars_needed = min(1000, max(50, math.ceil(age_s / 60) + 20))
+        df_1m = await load_candles(inst, "1m", bars=bars_needed, refresh=True)
         if not df_1m.empty:
             latest_bar = df_1m.iloc[-1]
     except (CapitalAuthError, CapitalAPIError) as e:
         log.warning("%s: 1m fetch fehlgeschlagen: %s", inst, e)
 
-    # 2. Offene Trades gegen aktuelle Bar checken
-    if latest_bar is not None:
+    # 2. Offene Trades: Catch-up Scan über alle Bars seit Öffnung
+    if not df_1m.empty:
         still_open = []
         for trade in instance.open_trades:
-            exit_hit = paper_broker.check_intrabar_exit(trade, latest_bar)
-            if exit_hit is None:
+            hit = paper_broker.scan_exit_over_bars(trade, df_1m)
+            if hit is None:
                 still_open.append(trade)
                 continue
-            exit_raw, reason = exit_hit
-            closed = paper_broker.close_position(trade, exit_raw, latest_bar, reason)
+            hit_bar, exit_raw, reason, hit_ts = hit
+            closed = paper_broker.close_position(trade, exit_raw, hit_bar, reason, close_time=hit_ts)
             instance.equity += closed.pnl_abs
             instance.closed_trades.append(closed)
             instance.append_tick_log(TickLogEntry(
-                timestamp=_now(), action="close",
+                timestamp=closed.close_time, action="close",
                 decision=f"closed_{reason}",
                 variant=closed.variant,
                 detail=(f"{closed.side} @ {closed.exit:.2f} → "
-                        f"{closed.pnl_abs:+.2f} ({closed.r_multiple:+.2f}R)"),
+                        f"{closed.pnl_abs:+.2f} ({closed.r_multiple:+.2f}R)"
+                        + (" [catch-up]" if closed.close_time < _now().replace(microsecond=0) else "")),
                 related_trade_id=closed.id,
             ))
-            log.info("%s CLOSED %s %s → %.2f (%+.2fR)",
+            log.info("%s CLOSED %s %s → %.2f (%+.2fR)  [hit @ %s]",
                      inst, closed.side, closed.exit_reason,
-                     closed.pnl_abs, closed.r_multiple)
+                     closed.pnl_abs, closed.r_multiple, closed.close_time)
         instance.open_trades = still_open
 
     # 3. Signal-Eval — nur wenn kein offener Trade

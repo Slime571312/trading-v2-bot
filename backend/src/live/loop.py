@@ -111,25 +111,32 @@ async def _do_tick(
     inst_name = instance.instrument
     eval_this_tick = (tick_count % SIGNAL_TICKS_INTERVAL == 1)
 
-    # ── 1. 1m-Bar fetchen für intrabar-Check ─────────────────────────
+    # ── 1. 1m-Bars laden — Catch-up: genug Bars seit Trade-Öffnung ───
+    df_1m = pd.DataFrame()
+    latest_bar = None
     try:
-        df_1m = await load_candles(inst_name, "1m", bars=20)
+        import math
+        bars_needed = 50
+        if instance.open_trades:
+            oldest = min(t.open_time for t in instance.open_trades)
+            age_s = (_now() - oldest).total_seconds()
+            bars_needed = min(1000, max(50, math.ceil(age_s / 60) + 20))
+        df_1m = await load_candles(inst_name, "1m", bars=bars_needed, refresh=True)
         latest_bar = df_1m.iloc[-1] if not df_1m.empty else None
     except (CapitalAuthError, CapitalAPIError) as e:
         log.warning("%s tick %d: 1m-Fetch fehlgeschlagen: %s", inst_name, tick_count, e)
-        latest_bar = None
 
-    # ── 2. Offene Trades intrabar-Check ──────────────────────────────
-    if latest_bar is not None:
+    # ── 2. Offene Trades — Catch-up Scan über alle Bars seit Öffnung ─
+    if not df_1m.empty:
         async with state_lock:
             still_open: list[OpenTrade] = []
             for trade in instance.open_trades:
-                exit_hit = paper_broker.check_intrabar_exit(trade, latest_bar)
-                if exit_hit is None:
+                hit = paper_broker.scan_exit_over_bars(trade, df_1m)
+                if hit is None:
                     still_open.append(trade)
                     continue
-                exit_raw, reason = exit_hit
-                closed = paper_broker.close_position(trade, exit_raw, latest_bar, reason)
+                hit_bar, exit_raw, reason, hit_ts = hit
+                closed = paper_broker.close_position(trade, exit_raw, hit_bar, reason, close_time=hit_ts)
                 instance.equity += closed.pnl_abs
                 instance.closed_trades.append(closed)
                 instance.append_tick_log(TickLogEntry(

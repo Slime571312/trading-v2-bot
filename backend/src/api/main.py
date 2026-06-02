@@ -58,25 +58,37 @@ async def lifespan(app: FastAPI):
     log_app.info("SignalCache Background-Task gestartet")
 
     async def _gh_actions_sync():
-        """Alle 60s: git pull → live_state.json neu lesen → Dashboard aktuell."""
-        import subprocess
+        """Alle 60s: GitHub-State holen — nur wenn GitHub neuer als lokal."""
+        import subprocess, json as _json
+        from src.live.state import STATE_FILE
         repo_root = Path(__file__).resolve().parents[3]
+
+        def _latest_tick(data):
+            ticks = [v.get("last_tick") for v in data.get("instances", {}).values() if v.get("last_tick")]
+            return max(ticks) if ticks else ""
+
         while True:
             await asyncio.sleep(60)
-            if not orch.any_running():
-                try:
-                    proc = subprocess.run(
-                        ["git", "fetch", "origin", "main"],
-                        cwd=repo_root, capture_output=True, timeout=15,
-                    )
-                    subprocess.run(
-                        ["git", "checkout", "origin/main", "--",
-                         "backend/state/live_state.json"],
-                        cwd=repo_root, capture_output=True, timeout=10,
-                    )
-                except Exception:
-                    pass
-                orch.reload_from_file()
+            if orch.any_running():
+                continue
+            try:
+                subprocess.run(["git", "fetch", "origin", "main"],
+                               cwd=repo_root, capture_output=True, timeout=15)
+                res = subprocess.run(
+                    ["git", "show", "origin/main:backend/state/live_state.json"],
+                    cwd=repo_root, capture_output=True, timeout=10, text=True,
+                )
+                if res.returncode == 0:
+                    remote_data = _json.loads(res.stdout)
+                    local_data = _json.loads(STATE_FILE.read_text())
+                    if _latest_tick(remote_data) > _latest_tick(local_data):
+                        STATE_FILE.write_text(res.stdout)
+                        log_app.debug("GH-Sync: Remote-State ist neuer — übernommen")
+                    else:
+                        log_app.debug("GH-Sync: Lokaler State ist aktuell — behalten")
+            except Exception:
+                pass
+            orch.reload_from_file()
 
     sync_task = asyncio.create_task(_gh_actions_sync(), name="gh_state_sync")
     log_app.info("GitHub-Actions-State-Sync gestartet (60s Intervall)")
@@ -1008,22 +1020,72 @@ async def bot_stop_all() -> BotOverviewResponse:
 
 @app.post("/bot/sync")
 async def bot_sync_from_github() -> dict:
-    """git pull → live_state.json neu laden — holt GH-Actions-Updates sofort."""
-    import subprocess
+    """GitHub → live_state.json, nur wenn GitHub-Version neuer ist.
+
+    Vergleicht last_tick des neuesten Instruments lokal vs. remote.
+    Wenn lokale Version aktueller, wird sie behalten (und gepusht).
+    """
+    import subprocess, json as _json
+    from src.live.state import STATE_FILE
     orch = get_orchestrator()
     if orch.any_running():
         return {"synced": False, "message": "Übersprungen — lokale Bots laufen noch"}
     repo_root = Path(__file__).resolve().parents[3]
+
+    # GH-Version in tmp holen ohne die lokale Datei zu überschreiben
     try:
-        subprocess.run(["git", "fetch", "origin", "main"],
-                       cwd=repo_root, capture_output=True, timeout=15)
-        subprocess.run(["git", "checkout", "origin/main", "--",
-                        "backend/state/live_state.json"],
-                       cwd=repo_root, capture_output=True, timeout=10)
+        res = subprocess.run(
+            ["git", "show", "origin/main:backend/state/live_state.json"],
+            cwd=repo_root, capture_output=True, timeout=20, text=True
+        )
+        if res.returncode != 0:
+            subprocess.run(["git", "fetch", "origin", "main"],
+                           cwd=repo_root, capture_output=True, timeout=15)
+            res = subprocess.run(
+                ["git", "show", "origin/main:backend/state/live_state.json"],
+                cwd=repo_root, capture_output=True, timeout=10, text=True
+            )
     except Exception as e:
-        return {"synced": False, "message": f"git fetch fehlgeschlagen: {e}"}
+        orch.reload_from_file()
+        return {"synced": True, "message": f"git nicht verfügbar — lokale Datei geladen: {e}"}
+
+    if res.returncode != 0:
+        orch.reload_from_file()
+        return {"synced": True, "message": "Kein Remote-State — lokale Datei geladen"}
+
+    # Timestamps vergleichen: welche Version ist neuer?
+    try:
+        remote_data = _json.loads(res.stdout)
+        local_data = _json.loads(STATE_FILE.read_text())
+
+        def _latest_tick(data):
+            ticks = [v.get("last_tick") for v in data.get("instances", {}).values() if v.get("last_tick")]
+            return max(ticks) if ticks else ""
+
+        remote_tick = _latest_tick(remote_data)
+        local_tick = _latest_tick(local_data)
+
+        if local_tick >= remote_tick:
+            orch.reload_from_file()
+            return {"synced": True, "message": f"Lokale Version aktueller ({local_tick[:19]}) — behalten"}
+
+        # Remote ist neuer → übernehmen
+        STATE_FILE.write_text(res.stdout)
+    except Exception:
+        pass
+
     orch.reload_from_file()
     return {"synced": True, "message": "State von GitHub geholt und neu geladen"}
+
+
+@app.post("/bot/reload-local")
+async def bot_reload_local() -> dict:
+    """Lokale live_state.json sofort neu laden, ohne git-Operationen."""
+    orch = get_orchestrator()
+    if orch.any_running():
+        return {"reloaded": False, "message": "Bots laufen — kein Reload"}
+    orch.reload_from_file()
+    return {"reloaded": True, "message": "State aus lokaler Datei geladen"}
 
 
 @app.websocket("/ws/live")
