@@ -53,13 +53,16 @@ def evaluate(
     detected_sweep = None
     df_htf: pd.DataFrame | None = None
 
+    # Session-Filter: aktuelle Uhrzeit prüfen, nicht den letzten gecachten Bar.
+    # Gecachte Bars können Stunden alt sein — df.index[-1] wäre dann falsch.
+    _now_utc = pd.Timestamp.now(tz="UTC")
+    if not sessions_mod.is_in_session(_now_utc, instrument):
+        log.debug("evaluate %s: outside session at %s", instrument, _now_utc.isoformat())
+        return None
+
     for tf in htf_order:
         df = bars.get(tf)
         if df is None or len(df) < 20:
-            continue
-        # Session-Filter — wenn der aktuelle Bar außerhalb der Session ist, kein Entry
-        if not sessions_mod.is_in_session(df.index[-1], instrument):
-            log.debug("evaluate %s: %s outside session", instrument, tf)
             continue
         levels = liquidity_mod.liquidity_levels(df, bias.direction)
         sweeps = sweep_mod.detect_sweeps(df, levels, tf=tf, lookback=sweep_lookback_bars)
@@ -92,7 +95,11 @@ def evaluate(
         # idx kann Slice sein bei Duplikaten — wir nehmen den ersten Treffer
         if isinstance(idx, slice):
             idx = idx.start
-        candidate = structure_mod.find_bos_after(df, bias.direction, int(idx))
+        # Vault (CHoCH.md): CHoCH ist der frühere, präzisere LTF-Trigger nach HTF-Sweep.
+        # BOS als Fallback wenn CHoCH nichts liefert (mehr Bestätigung, späteren Entry).
+        candidate = structure_mod.find_choch_after(df, bias.direction, int(idx))
+        if candidate is None:
+            candidate = structure_mod.find_bos_after(df, bias.direction, int(idx))
         if candidate is not None:
             bos = candidate
             ltf_used = tf
