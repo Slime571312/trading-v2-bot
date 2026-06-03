@@ -24,6 +24,12 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
+      # Neuesten State holen — kritisch damit offene Trades erkannt werden.
+      # Ohne diesen Pull lädt der Bot den State vom Checkout-Zeitpunkt,
+      # nicht den State den ein parallel laufender Run gerade committed hat.
+      - name: Neuesten State pullen
+        run: git pull origin main --rebase
+
       - name: Python Setup
         uses: actions/setup-python@v5
         with:
@@ -49,4 +55,5 @@ jobs:
           git config user.email "bot@users.noreply.github.com"
           git add -f backend/state/live_state.json
           git diff --staged --quiet || git commit -m "bot: tick $(date -u +'%Y-%m-%d %H:%M') UTC [skip ci]"
+          git pull origin main --rebase
           git push

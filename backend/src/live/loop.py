@@ -170,6 +170,19 @@ async def _do_tick(
         ))
         return
 
+    # Daily-Loss-Limit (Vault Risk.md): max 2 SL-Hits pro Tag
+    today = _now().date()
+    sl_today = sum(
+        1 for t in instance.closed_trades
+        if t.exit_reason == "sl" and t.close_time.date() == today
+    )
+    if sl_today >= 2:
+        instance.append_tick_log(TickLogEntry(
+            timestamp=_now(), action="skip", decision="daily_loss_limit",
+            detail=f"{sl_today} SL-Hits heute — kein weiterer Entry",
+        ))
+        return
+
     try:
         bars: dict[str, pd.DataFrame] = {}
         for tf in LIVE_TFS:

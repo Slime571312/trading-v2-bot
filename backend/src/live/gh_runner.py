@@ -35,6 +35,9 @@ log = logging.getLogger("gh_runner")
 INSTRUMENTS = ["DE40", "NASDAQ", "SP500", "BTC"]
 LIVE_TFS = ["1d", "1h", "30m", "15m", "5m", "1m"]
 
+# Vault Risk.md: max 1-3% Verlust pro Tag → bei 1% Risk/Trade = max 2 SL-Hits täglich
+MAX_DAILY_SL_HITS = 2
+
 
 async def _tick(instance: BotInstance) -> None:
     """Vollständiger Tick für ein Instrument: SL/TP-Check + Signal-Eval."""
@@ -86,12 +89,26 @@ async def _tick(instance: BotInstance) -> None:
                      closed.pnl_abs, closed.r_multiple, closed.close_time)
         instance.open_trades = still_open
 
-    # 3. Signal-Eval — nur wenn kein offener Trade
+    # 3. Signal-Eval — Guards: kein offener Trade + Daily-Loss-Limit
     if instance.open_trades:
         instance.append_tick_log(TickLogEntry(
             timestamp=_now(), action="skip", decision="already_in_position",
             detail=f"open: {instance.open_trades[0].id}",
         ))
+        return
+
+    # Daily-Loss-Limit: max 2 SL-Hits pro Tag pro Instrument (Vault Risk.md: max 1-3%/Tag)
+    today = _now().date()
+    sl_today = sum(
+        1 for t in instance.closed_trades
+        if t.exit_reason == "sl" and t.close_time.date() == today
+    )
+    if sl_today >= MAX_DAILY_SL_HITS:
+        instance.append_tick_log(TickLogEntry(
+            timestamp=_now(), action="skip", decision="daily_loss_limit",
+            detail=f"{sl_today} SL-Hits heute ≥ Limit {MAX_DAILY_SL_HITS} — kein weiterer Entry",
+        ))
+        log.warning("%s Daily-Loss-Limit erreicht (%d SL-Hits heute) — kein Entry", inst, sl_today)
         return
 
     try:
