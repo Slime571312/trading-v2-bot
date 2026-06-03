@@ -29,6 +29,7 @@ from .state import (
     BotInstance, BotState, ClosedTrade, OpenTrade, TickLogEntry,
     save_state, _now,
 )
+from .trade_limits import TradeLimitsConfig, can_trade
 
 if TYPE_CHECKING:
     pass
@@ -170,17 +171,16 @@ async def _do_tick(
         ))
         return
 
-    # Daily-Loss-Limit (Vault Risk.md): max 2 SL-Hits pro Tag
-    today = _now().date()
-    sl_today = sum(
-        1 for t in instance.closed_trades
-        if t.exit_reason == "sl" and t.close_time.date() == today
-    )
-    if sl_today >= 2:
+    # Volle Trade-Limits-Pipeline (Bot/TradeGate.md, Bot/Trade-Limits.md)
+    cfg = TradeLimitsConfig(initial_capital=instance.initial_capital)
+    allowed, reason = can_trade(_now(), inst_name, instance.equity,
+                                 instance.closed_trades, cfg=cfg)
+    if not allowed:
         instance.append_tick_log(TickLogEntry(
-            timestamp=_now(), action="skip", decision="daily_loss_limit",
-            detail=f"{sl_today} SL-Hits heute — kein weiterer Entry",
+            timestamp=_now(), action="skip", decision="trade_limit_blocked",
+            detail=reason or "unknown",
         ))
+        log.info("%s Trade-Limit: %s", inst_name, reason)
         return
 
     try:

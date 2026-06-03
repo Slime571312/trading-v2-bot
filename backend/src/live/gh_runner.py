@@ -22,6 +22,7 @@ from src.live.state import (
     BotInstance, BotState, TickLogEntry,
     load_state, save_state, _now,
 )
+from src.live.trade_limits import TradeLimitsConfig, can_trade
 from src.strategy_core import evaluate as evaluate_signal
 from src.strategy_core.bias import compute_bias
 
@@ -34,9 +35,6 @@ log = logging.getLogger("gh_runner")
 
 INSTRUMENTS = ["DE40", "NASDAQ", "SP500", "BTC"]
 LIVE_TFS = ["1d", "1h", "30m", "15m", "5m", "1m"]
-
-# Vault Risk.md: max 1-3% Verlust pro Tag → bei 1% Risk/Trade = max 2 SL-Hits täglich
-MAX_DAILY_SL_HITS = 2
 
 
 async def _tick(instance: BotInstance) -> None:
@@ -89,7 +87,7 @@ async def _tick(instance: BotInstance) -> None:
                      closed.pnl_abs, closed.r_multiple, closed.close_time)
         instance.open_trades = still_open
 
-    # 3. Signal-Eval — Guards: kein offener Trade + Daily-Loss-Limit
+    # 3. Signal-Eval — Gate 0: Trade-Limits (Bot/TradeGate.md, Bot/Trade-Limits.md)
     if instance.open_trades:
         instance.append_tick_log(TickLogEntry(
             timestamp=_now(), action="skip", decision="already_in_position",
@@ -97,18 +95,17 @@ async def _tick(instance: BotInstance) -> None:
         ))
         return
 
-    # Daily-Loss-Limit: max 2 SL-Hits pro Tag pro Instrument (Vault Risk.md: max 1-3%/Tag)
-    today = _now().date()
-    sl_today = sum(
-        1 for t in instance.closed_trades
-        if t.exit_reason == "sl" and t.close_time.date() == today
-    )
-    if sl_today >= MAX_DAILY_SL_HITS:
+    # Volle Trade-Limits-Pipeline: Daily/Weekly Loss, Consecutive-SL, Revenge-Cooldown,
+    # Max-Trades-per-Day/Session/Pair
+    cfg = TradeLimitsConfig(initial_capital=instance.initial_capital)
+    allowed, reason = can_trade(_now(), inst, instance.equity,
+                                 instance.closed_trades, cfg=cfg)
+    if not allowed:
         instance.append_tick_log(TickLogEntry(
-            timestamp=_now(), action="skip", decision="daily_loss_limit",
-            detail=f"{sl_today} SL-Hits heute ≥ Limit {MAX_DAILY_SL_HITS} — kein weiterer Entry",
+            timestamp=_now(), action="skip", decision="trade_limit_blocked",
+            detail=reason or "unknown",
         ))
-        log.warning("%s Daily-Loss-Limit erreicht (%d SL-Hits heute) — kein Entry", inst, sl_today)
+        log.info("%s Trade-Limit: %s", inst, reason)
         return
 
     try:

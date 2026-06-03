@@ -16,6 +16,7 @@ import pandas as pd
 
 from . import bias as bias_mod
 from . import liquidity as liquidity_mod
+from . import news as news_mod
 from . import rr as rr_mod
 from . import sessions as sessions_mod
 from . import structure as structure_mod
@@ -54,10 +55,15 @@ def evaluate(
     df_htf: pd.DataFrame | None = None
 
     # Session-Filter: aktuelle Uhrzeit prüfen, nicht den letzten gecachten Bar.
-    # Gecachte Bars können Stunden alt sein — df.index[-1] wäre dann falsch.
     _now_utc = pd.Timestamp.now(tz="UTC")
     if not sessions_mod.is_in_session(_now_utc, instrument):
         log.debug("evaluate %s: outside session at %s", instrument, _now_utc.isoformat())
+        return None
+
+    # News-Filter (Bot/News-Integration.md): kein Entry ±30/+15 Min um High-Impact-Events
+    in_news, event_title = news_mod.is_news_window(instrument, now=_now_utc.to_pydatetime())
+    if in_news:
+        log.info("evaluate %s: News-Window aktiv (%s) — skip", instrument, event_title)
         return None
 
     for tf in htf_order:
@@ -112,7 +118,8 @@ def evaluate(
 
     # ── Schritt 5: RR-Check ──────────────────────────────────────────────
     entry_primary = float(df_ltf["close"].iloc[bos.bar_idx])
-    sl = rr_mod.compute_sl(bias.direction, detected_sweep, df_htf)
+    # SL mit ATR-Buffer (per-Instrument kalibriert — SL-Placement.md)
+    sl = rr_mod.compute_sl(bias.direction, detected_sweep, df_htf, instrument=instrument)
     htf_pivots = find_pivots(df_htf)
     tp = rr_mod.find_tp_target(bias.direction, entry_primary, htf_pivots)
     if tp is None:
@@ -153,8 +160,9 @@ def evaluate(
             else:
                 return None  # weder OB noch FVG → Setup verworfen
 
-    # Mindest-RR auch nach Retracement-Verbesserung — wenn auch das nicht passt, skip
-    if variant is None or rr < rr_threshold * 0.75:
+    # Hard-Floor MIN_RR (TP-Strategy.md): kein Setup unter 1.5 RR, egal welche Variant
+    if variant is None or rr < rr_mod.MIN_RR:
+        log.debug("evaluate %s: RR %.2f < MIN_RR %.2f — skip", instrument, rr, rr_mod.MIN_RR)
         return None
 
     return Signal(

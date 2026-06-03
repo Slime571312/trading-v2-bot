@@ -2,6 +2,8 @@
 
 Quellen:
 - Trading/SL und TP.md
+- Trading/Bot/SL-Placement.md (ATR-Buffer, Multi-Method)
+- Trading/Bot/TP-Strategy.md (Min-RR-Filter)
 - Trading/Bot/Playbook.md (Schritt 5)
 """
 from __future__ import annotations
@@ -11,18 +13,58 @@ import pandas as pd
 from ._types import Side, Sweep, Swing
 
 
-def compute_sl(side: Side, sweep: Sweep, htf_df: pd.DataFrame, buffer_pct: float = 0.001) -> float:
-    """SL jenseits der Sweep-Wick + Spread-Buffer.
+# Aus SL-Placement.md: per-Instrument kalibrierte ATR-Multiplier.
+# ATR×Multiplier statt Pip-Buffer skaliert mit der Volatilität.
+ATR_MULT: dict[str, float] = {
+    "BTC":    0.15,
+    "DE40":   0.10,
+    "NASDAQ": 0.10,
+    "SP500":  0.12,
+}
 
-    `buffer_pct` ist relativ zum Wick-Preis (Default 0.1 % — robust für CFDs;
-    broker-spezifischer Wert kommt in Etappe 3 als `slippage`-Modell dazu).
+# Aus TP-Strategy.md: Setup wird verworfen wenn RR1 < MIN_RR
+MIN_RR = 1.5
+
+
+def _atr(htf_df: pd.DataFrame, period: int = 14) -> float:
+    """True Range Average — robuster als reine close-Differenz."""
+    if len(htf_df) < period + 1:
+        return 0.0
+    high = htf_df["high"].astype(float)
+    low = htf_df["low"].astype(float)
+    close = htf_df["close"].astype(float)
+    prev_close = close.shift(1)
+    tr = pd.concat([
+        high - low,
+        (high - prev_close).abs(),
+        (low - prev_close).abs(),
+    ], axis=1).max(axis=1)
+    atr_val = tr.tail(period).mean()
+    return float(atr_val) if pd.notna(atr_val) else 0.0
+
+
+def compute_sl(
+    side: Side,
+    sweep: Sweep,
+    htf_df: pd.DataFrame,
+    instrument: str = "DE40",
+) -> float:
+    """SL jenseits der Sweep-Wick + ATR-basierter Buffer.
+
+    Aus SL-Placement.md: ATR×0.10–0.15 statt prozentual.
+    Pip-Buffer (10–20 Pips) ist cross-Instrument unsinnig — ATR skaliert mit Volatilität.
     """
+    atr = _atr(htf_df, period=14)
+    mult = ATR_MULT.get(instrument, 0.12)
+    buffer = atr * mult
+
     if side == "long":
         wick = float(htf_df["low"].iloc[sweep.bar_idx])
-        return wick * (1 - buffer_pct)
+        # Wenn ATR=0 (zu wenig Bars), Fallback auf 0.1% proportional
+        return wick - buffer if buffer > 0 else wick * (1 - 0.001)
     else:
         wick = float(htf_df["high"].iloc[sweep.bar_idx])
-        return wick * (1 + buffer_pct)
+        return wick + buffer if buffer > 0 else wick * (1 + 0.001)
 
 
 def find_tp_target(side: Side, entry: float, htf_pivots: list[Swing]) -> float | None:

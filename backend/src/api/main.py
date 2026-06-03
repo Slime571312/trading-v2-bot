@@ -1088,6 +1088,20 @@ async def bot_reload_local() -> dict:
     return {"reloaded": True, "message": "State aus lokaler Datei geladen"}
 
 
+@app.get("/news/{instrument}")
+async def news_upcoming(instrument: InstrumentName, hours: int = 24) -> dict:
+    """Kommende High-Impact-Events für ein Instrument (für Dashboard)."""
+    from src.strategy_core import news as news_mod
+    events = news_mod.upcoming_events(instrument, hours_ahead=hours)
+    in_window, title = news_mod.is_news_window(instrument)
+    return {
+        "instrument": instrument,
+        "in_news_window": in_window,
+        "current_event": title,
+        "upcoming": events,
+    }
+
+
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket) -> None:
     """WebSocket für Live-Updates — sendet initial alle Instanzen, dann Push pro Event."""
