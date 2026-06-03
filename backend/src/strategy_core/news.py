@@ -32,27 +32,41 @@ NO_TRADE_TITLES = (
 )
 
 CACHE_TTL_HOURS = 6
+ERROR_BACKOFF_MIN = 60   # bei Fehler 1h nicht erneut versuchen
 FF_URL = "https://nfs.faireconomy.media/ff_calendar_thisweek.json"
 
-_cache: dict = {"data": [], "fetched_at": None}
+_cache: dict = {"data": [], "fetched_at": None, "last_error_at": None}
 
 
 def _fetch_calendar() -> list[dict]:
-    """Holt den FF-Calendar, cached für CACHE_TTL_HOURS Stunden."""
+    """Holt den FF-Calendar, cached für CACHE_TTL_HOURS Stunden.
+
+    Bei Fetch-Fehler (z.B. 429 Rate-Limit): 1h Backoff bevor neuer Versuch.
+    """
     now = datetime.now(timezone.utc)
+
+    # Frischer Cache vorhanden? → nutzen
     if (_cache["fetched_at"] and
             now - _cache["fetched_at"] < timedelta(hours=CACHE_TTL_HOURS)):
         return _cache["data"]
+
+    # Letzter Versuch in Backoff-Zeit gescheitert? → alten Cache behalten
+    if (_cache["last_error_at"] and
+            now - _cache["last_error_at"] < timedelta(minutes=ERROR_BACKOFF_MIN)):
+        return _cache["data"]
+
     try:
         with httpx.Client(timeout=10.0) as client:
             resp = client.get(FF_URL, headers={"User-Agent": "Mozilla/5.0"})
             resp.raise_for_status()
             _cache["data"] = resp.json()
             _cache["fetched_at"] = now
+            _cache["last_error_at"] = None
             log.info("News-Calendar geladen: %d Events", len(_cache["data"]))
     except Exception as e:
-        log.warning("Forex-Factory-Fetch fehlgeschlagen: %s", e)
-        # Bei Fehler: alten Cache behalten (sicherer als nichts), bei leerem Cache → leer
+        _cache["last_error_at"] = now
+        log.warning("Forex-Factory-Fetch fehlgeschlagen (%dmin Backoff): %s",
+                    ERROR_BACKOFF_MIN, e)
     return _cache["data"]
 
 
