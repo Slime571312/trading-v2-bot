@@ -2,21 +2,25 @@ name: Bot Tick
 
 on:
   schedule:
-    - cron: '*/5 * * * *'   # alle 5 Minuten
-  workflow_dispatch:          # manuell über GitHub UI triggerbar
+    # Mehrere Zeiten erhöhen die Chance dass mindestens einer feuert
+    # (GH Actions Free-Tier Cron ist unzuverlässig)
+    - cron: '*/5 * * * *'      # 00, 05, 10, …
+    - cron: '2-59/5 * * * *'   # 02, 07, 12, …
+  workflow_dispatch:           # manuell ODER per PAT-Self-Dispatch
 
-# Nur ein Tick gleichzeitig — kein zweiter startet während der erste läuft
+# Nur ein Tick gleichzeitig
 concurrency:
   group: bot-tick
   cancel-in-progress: false
 
 permissions:
-  contents: write   # für git push
+  contents: write
+  actions: write    # für Self-Dispatch via gh api
 
 jobs:
   tick:
     runs-on: ubuntu-latest
-    timeout-minutes: 5   # Loop läuft 4:30 Min, dann nahtlos nächster Cron
+    timeout-minutes: 5
 
     steps:
       - name: Checkout
@@ -24,9 +28,6 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Neuesten State holen — kritisch damit offene Trades erkannt werden.
-      # Ohne diesen Pull lädt der Bot den State vom Checkout-Zeitpunkt,
-      # nicht den State den ein parallel laufender Run gerade committed hat.
       - name: Neuesten State pullen
         run: git pull origin main --rebase
 
@@ -57,3 +58,22 @@ jobs:
           git diff --staged --quiet || git commit -m "bot: tick $(date -u +'%Y-%m-%d %H:%M') UTC [skip ci]"
           git pull origin main --rebase
           git push
+
+      # Self-Dispatch: Triggere den nächsten Run am Ende dieses Runs.
+      # Nutzt PAT_TOKEN (Fine-Grained PAT mit Actions:write) — GITHUB_TOKEN kann
+      # keine Workflows triggern (Anti-Loop-Schutz von GitHub).
+      # Wenn kein PAT vorhanden: nur Cron läuft (unzuverlässig).
+      - name: Nächsten Run triggern
+        if: success() && env.PAT_TOKEN != ''
+        env:
+          PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+        run: |
+          # Warte 30s damit der Run-Slot frei wird, dann dispatch
+          sleep 30
+          curl -X POST \
+            -H "Authorization: Bearer $PAT_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2022-11-28" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/bot_tick.yml/dispatches \
+            -d '{"ref":"main"}'
+          echo "✓ Nächster Run getriggert"
