@@ -70,10 +70,18 @@ class OpenTrade:
     htf_used: str
     ltf_used: str
     rr_at_open: float
+    # Partial-Close + Dynamic SL (Bot/Partial-Close.md + Bot/Dynamic-SL.md)
+    tp1: float | None = None           # Erstes 50%-Teilziel (Hälfte des Wegs zu TP)
+    tp1_hit: bool = False              # True nach TP1-Hit + BE-Move
+    original_size: float | None = None # Ursprüngliche Size (vor partial close)
+    original_sl: float | None = None   # Ursprünglicher SL (Analytics)
+    partial_pnl: float = 0.0           # Bereits realisierter PnL aus TP1
+    partial_close_time: datetime | None = None  # Wann TP1 geschnitten wurde
 
     def to_json(self) -> dict:
         d = asdict(self)
         d["open_time"] = _iso(self.open_time)
+        d["partial_close_time"] = _iso(self.partial_close_time)
         return d
 
     @classmethod
@@ -84,6 +92,12 @@ class OpenTrade:
             entry=d["entry"], sl=d["sl"], tp=d["tp"], size=d["size"],
             variant=d["variant"], htf_used=d["htf_used"], ltf_used=d["ltf_used"],
             rr_at_open=d["rr_at_open"],
+            tp1=d.get("tp1"),
+            tp1_hit=d.get("tp1_hit", False),
+            original_size=d.get("original_size"),
+            original_sl=d.get("original_sl"),
+            partial_pnl=d.get("partial_pnl", 0.0),
+            partial_close_time=_parse_iso(d.get("partial_close_time")),
         )
 
 

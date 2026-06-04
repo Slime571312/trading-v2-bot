@@ -127,34 +127,59 @@ async def _do_tick(
     except (CapitalAuthError, CapitalAPIError) as e:
         log.warning("%s tick %d: 1m-Fetch fehlgeschlagen: %s", inst_name, tick_count, e)
 
-    # ── 2. Offene Trades — Catch-up Scan über alle Bars seit Öffnung ─
+    # ── 2. Offene Trades — Partial-Close + Catch-up (Bot/Partial-Close.md) ──
     if not df_1m.empty:
         async with state_lock:
             still_open: list[OpenTrade] = []
             for trade in instance.open_trades:
-                hit = paper_broker.scan_exit_over_bars(trade, df_1m)
-                if hit is None:
+                events = paper_broker.scan_with_partial_close(trade, df_1m)
+                full_closed = False
+                for ev in events:
+                    if ev["kind"] == "partial_tp1":
+                        instance.equity += ev["pnl"]
+                        instance.append_tick_log(TickLogEntry(
+                            timestamp=trade.partial_close_time or _now(),
+                            action="close", decision="partial_tp1",
+                            variant=trade.variant,
+                            detail=(f"50% @ {trade.tp1:.2f} → +{ev['pnl']:.2f}, "
+                                    f"SL→BE ({trade.entry:.2f})"),
+                            related_trade_id=trade.id,
+                        ))
+                        log.info("%s PARTIAL_TP1 %s @ %.2f → +%.2f, SL→BE",
+                                 inst_name, trade.side, trade.tp1, ev["pnl"])
+                        await push_to_dashboard({
+                            "type": "partial_close", "instrument": inst_name,
+                            "trade_id": trade.id, "tp1": trade.tp1, "pnl": ev["pnl"],
+                            "new_sl": trade.sl,
+                        })
+                    elif ev["kind"] == "full_close":
+                        closed = paper_broker.close_position(
+                            trade, ev["exit"], ev["bar"], ev["reason"], close_time=ev["ts"],
+                        )
+                        instance.equity += closed.pnl_abs
+                        instance.closed_trades.append(closed)
+                        total_pnl = closed.pnl_abs + trade.partial_pnl
+                        risk_basis = abs(trade.original_sl - trade.entry) * (trade.original_size or trade.size)
+                        total_r = total_pnl / risk_basis if risk_basis > 0 else 0.0
+                        instance.append_tick_log(TickLogEntry(
+                            timestamp=closed.close_time, action="close",
+                            decision=f"closed_{ev['reason']}",
+                            variant=closed.variant,
+                            detail=(f"{closed.side} rest @ {closed.exit:.2f} → "
+                                    f"{closed.pnl_abs:+.2f} | total {total_pnl:+.2f} "
+                                    f"({total_r:+.2f}R)"),
+                            related_trade_id=closed.id,
+                        ))
+                        log.info("%s CLOSED %s %s rest %+.2f total %+.2f (%+.2fR)",
+                                 inst_name, closed.side, closed.exit_reason,
+                                 closed.pnl_abs, total_pnl, total_r)
+                        await push_to_dashboard({
+                            "type": "trade_closed", "instrument": inst_name,
+                            "trade": closed.to_json(),
+                        })
+                        full_closed = True
+                if not full_closed:
                     still_open.append(trade)
-                    continue
-                hit_bar, exit_raw, reason, hit_ts = hit
-                closed = paper_broker.close_position(trade, exit_raw, hit_bar, reason, close_time=hit_ts)
-                instance.equity += closed.pnl_abs
-                instance.closed_trades.append(closed)
-                instance.append_tick_log(TickLogEntry(
-                    timestamp=_now(), action="close",
-                    decision=f"closed_{reason}",
-                    variant=closed.variant,
-                    detail=(f"{closed.side} @ {closed.exit:.2f} → "
-                            f"{closed.pnl_abs:+.2f} ({closed.r_multiple:+.2f}R)"),
-                    related_trade_id=closed.id,
-                ))
-                log.info("%s CLOSED %s %s %s → %.2f (%+.2fR)",
-                         inst_name, closed.side, closed.id, closed.exit_reason,
-                         closed.pnl_abs, closed.r_multiple)
-                await push_to_dashboard({
-                    "type": "trade_closed", "instrument": inst_name,
-                    "trade": closed.to_json(),
-                })
             instance.open_trades = still_open
 
     # ── 3. Engine-Eval für neue Entries (nur alle N Ticks) ──────────
