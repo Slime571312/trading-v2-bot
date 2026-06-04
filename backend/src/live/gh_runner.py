@@ -186,7 +186,7 @@ async def _tick(instance: BotInstance) -> None:
         log.warning("%s Capital-Fehler: %s", inst, e)
 
 
-LOOP_DURATION_S = 270   # 4:30 Min Loop — Cron feuert alle 5 Min → nahtlos
+LOOP_DURATION_S = 1740  # 29 Min Loop — fast volle 30-Min-Timeout, nur 1 Naht/30min
 TICK_INTERVAL_S = 30    # alle 30s ein Tick für alle Instrumente
 
 
