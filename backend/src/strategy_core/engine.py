@@ -66,6 +66,21 @@ def evaluate(
         log.info("evaluate %s: News-Window aktiv (%s) — skip", instrument, event_title)
         return None
 
+    # OPEX-Close-Window (Bot/OPEX-Calendar.md): letzte 30 Min am OPEX-Tag = Multi-Mrd Pin-Flows
+    if instrument not in sessions_mod.CRYPTO_INSTRUMENTS and sessions_mod.is_opex_close_window(_now_utc):
+        log.info("evaluate %s: OPEX-Close-Window — kein Entry", instrument)
+        return None
+
+    # Silver-Bullet (Bot/Silver-Bullet.md): strenger MIN_RR (2.0) außerhalb der NY-AM-Zone.
+    # Innerhalb der SB-Fenster bleibt MIN_RR = 1.5 (Standard) → Window gibt Edge, niedrigere Hürde.
+    # Für Indizes greift SB-NY-AM (15:00-16:00 UTC), für BTC alle drei Fenster (24/7).
+    if instrument in sessions_mod.CRYPTO_INSTRUMENTS:
+        _sb_active = sessions_mod.is_any_silver_bullet_window(_now_utc)
+    else:
+        _sb_active = sessions_mod.is_silver_bullet_window(_now_utc, "ny_am") or \
+                     sessions_mod.is_silver_bullet_window(_now_utc, "london_open")
+    _effective_min_rr = rr_mod.MIN_RR if _sb_active else 2.0
+
     for tf in htf_order:
         df = bars.get(tf)
         if df is None or len(df) < 20:
@@ -136,7 +151,21 @@ def evaluate(
     if rr_primary >= rr_threshold:
         variant = "primary"
     else:
-        # ── Schritt 6: Retracement-Suche — OB > FVG, mit optionalem EQ-Boost ──
+        # ── Schritt 6: Retracement-Suche — OB > FVG, mit OTE-Confluence-Check ──
+        # Dealing-Range für OTE: Impulse-Leg von Sweep-Extrem zu BOS-Extrem
+        if bias.direction == "long":
+            _dr_low = float(df_htf["low"].iloc[detected_sweep.bar_idx])
+            _dr_high = bos.body_extreme
+        else:
+            _dr_low = bos.body_extreme
+            _dr_high = float(df_htf["high"].iloc[detected_sweep.bar_idx])
+        _ote_bias = 1 if bias.direction == "long" else -1
+        _ote_zone = (
+            rr_mod.calculate_ote_zone(_dr_low, _dr_high, _ote_bias)
+            if _dr_low < _dr_high
+            else None
+        )
+
         # OB auf HTF suchen (wo der Sweep passierte, dort sitzt der echte OB)
         ob = zones_mod.find_order_block(df_htf, detected_sweep, bos)
         if ob is not None:
@@ -144,7 +173,15 @@ def evaluate(
             rr = rr_mod.rr_ratio(bias.direction, entry, sl, tp)
             eq_data = zones_mod.compute_equilibrium(detected_sweep, bos, df_htf)
             in_eq = zones_mod.in_eq_zone(entry, eq_data, bias.direction)
-            variant = "ultimate" if in_eq else "ob_retest"
+            # OTE ∩ OB = höchste Confluence (Rang 1 in Signal-Hierarchie)
+            if _ote_zone is not None and rr_mod.ote_confluence_entry(
+                entry, _ote_zone, ob.lower, ob.upper
+            ):
+                variant = "ote_ob_entry"
+            elif in_eq:
+                variant = "ultimate"
+            else:
+                variant = "ob_retest"
         else:
             # FVG auf LTF zwischen Sweep und BOS
             fvgs = zones_mod.find_fvgs(
@@ -160,9 +197,11 @@ def evaluate(
             else:
                 return None  # weder OB noch FVG → Setup verworfen
 
-    # Hard-Floor MIN_RR (TP-Strategy.md): kein Setup unter 1.5 RR, egal welche Variant
-    if variant is None or rr < rr_mod.MIN_RR:
-        log.debug("evaluate %s: RR %.2f < MIN_RR %.2f — skip", instrument, rr, rr_mod.MIN_RR)
+    # Hard-Floor MIN_RR (TP-Strategy.md + Silver-Bullet.md):
+    # in SB-Fenster: 1.5 (Standard). Außerhalb: 2.0 (strenger, weil Edge fehlt).
+    if variant is None or rr < _effective_min_rr:
+        log.debug("evaluate %s: RR %.2f < effective_MIN_RR %.2f (SB_active=%s) — skip",
+                  instrument, rr, _effective_min_rr, _sb_active)
         return None
 
     return Signal(
