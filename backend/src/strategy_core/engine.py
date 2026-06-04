@@ -15,6 +15,8 @@ import logging
 import pandas as pd
 
 from . import bias as bias_mod
+from . import conviction as conviction_mod
+from . import crypto_sentiment as crypto_mod
 from . import liquidity as liquidity_mod
 from . import news as news_mod
 from . import rr as rr_mod
@@ -42,11 +44,17 @@ def evaluate(
     if "1d" not in bars or len(bars["1d"]) < 10:
         return None
 
-    # ── Schritt 1: Daily-Bias ────────────────────────────────────────────
+    # ── Schritt 1: Daily-Bias + Multi-TF-Confluence ──────────────────────
     bias = bias_mod.compute_bias(bars["1d"])
     if bias.direction == "neutral":
         log.debug("evaluate %s: neutral bias → no signal", instrument)
         return None
+
+    # H4-Confluence (Bot/Bias-Detection.md): kein neuer API-Call, resample 1h → 4h
+    _h4_bias_dir = bias_mod.compute_h4_bias(bars["1h"]) if "1h" in bars else "neutral"
+    _mtf = bias_mod.multi_tf_confluence(bias.direction, _h4_bias_dir)
+    log.debug("evaluate %s: daily=%s h4=%s confluence=%s",
+              instrument, bias.direction, _h4_bias_dir, _mtf["label"])
 
     # ── Schritt 2+3: HTF-LQ + Sweep — höchster TF gewinnt ────────────────
     htf_order = ["1h", "30m", "15m"]
@@ -204,6 +212,37 @@ def evaluate(
                   instrument, rr, _effective_min_rr, _sb_active)
         return None
 
+    # ── Conviction-Score (Bot/Conviction-Score.md) ────────────────────────
+    # 10-Punkte Score + ADX-Regime → A/B/skip mit Size-Multiplikator
+    htf_tfs = {"1h", "30m", "15m"}
+    _ctx = conviction_mod.ConvictionContext(
+        instrument=instrument,
+        bias_clear=(bias.direction != "neutral"),
+        sweep_is_htf=(htf_used in htf_tfs),
+        bos_confirmed=True,   # ohne BOS wäre Code hier nie erreicht
+        active_zone=(ob is not None or fvg is not None),
+        is_kill_zone=_sb_active,
+        in_ote_zone=(variant == "ote_ob_entry"),
+        weekday_weight=conviction_mod.weekday_entry_weight(_now_utc),
+    )
+    # BTC-only: Funding-Rate als Kontradiktion (Bot/Crypto-Sentiment.md)
+    if instrument == "BTC":
+        _ctx.funding_contra = crypto_mod.is_funding_contra(bias.direction)
+        if _ctx.funding_contra:
+            log.info("evaluate BTC: Funding-Kontradiktion gegen %s — penalty -1",
+                     bias.direction)
+
+    _score, _breakdown = conviction_mod.compute_conviction_score(_ctx)
+    _adx = conviction_mod.compute_adx(bars.get("1h", bars["1d"]), period=14)
+    _contradictions = int(_ctx.smt_diverges) + int(_ctx.funding_contra)
+    _grade, _size_mult, _regime = conviction_mod.classify_setup(_score, _adx, _contradictions)
+    # Multi-TF-Confluence reduziert size_mult zusätzlich (aligned 1.0×, retrace 0.5×)
+    _size_mult *= _mtf["size_factor"]
+    if _grade == "skip" or _size_mult <= 0:
+        log.info("evaluate %s: skip (score=%d, regime=%s, adx=%.1f, mtf=%s)",
+                 instrument, _score, _regime, _adx, _mtf["label"])
+        return None
+
     return Signal(
         time=df_ltf.index[-1],
         instrument=instrument,
@@ -221,4 +260,8 @@ def evaluate(
         ob=ob,
         fvg=fvg,
         equilibrium=eq_data,
+        conviction_score=_score,
+        conviction_grade=_grade,
+        size_multiplier=_size_mult,
+        adx_regime=_regime,
     )

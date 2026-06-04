@@ -166,17 +166,19 @@ async def _tick(instance: BotInstance) -> None:
 
         current_bar = latest_bar if latest_bar is not None else bars["5m"].iloc[-1]
 
-        # OPEX-Size-Multiplikator (Bot/OPEX-Calendar.md): 0.5× Triple-Witching, 0.75× Monthly OPEX
+        # Combined Size-Multiplikator: OPEX × Conviction-Grade (A=1.0, B=0.5)
         from src.strategy_core import sessions as sessions_mod
         _opex_mult = sessions_mod.opex_size_multiplier(_now().date())
-        _effective_risk = instance.risk_pct * _opex_mult
+        _conv_mult = getattr(signal, "size_multiplier", 1.0)
+        _effective_risk = instance.risk_pct * _opex_mult * _conv_mult
 
         new_trade = paper_broker.open_position(
             signal, instance.equity, _effective_risk, current_bar,
         )
-        if new_trade is not None and _opex_mult < 1.0:
-            log.info("%s OPEX-Size-Reduktion: risk %.2f%% × %.2f → %.3f%%",
-                     inst, instance.risk_pct * 100, _opex_mult, _effective_risk * 100)
+        if new_trade is not None and (_opex_mult < 1.0 or _conv_mult < 1.0):
+            log.info("%s Size-Anpassung: risk %.2f%% × OPEX %.2f × Conv %.2f → %.3f%% (grade=%s)",
+                     inst, instance.risk_pct * 100, _opex_mult, _conv_mult,
+                     _effective_risk * 100, getattr(signal, "conviction_grade", "?"))
         if new_trade is None:
             instance.append_tick_log(TickLogEntry(
                 timestamp=_now(), action="skip",

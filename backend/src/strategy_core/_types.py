@@ -12,7 +12,7 @@ import pandas as pd
 
 Side = Literal["long", "short"]
 BiasDir = Literal["long", "short", "neutral"]
-SignalVariant = Literal["primary", "ob_retest", "fvg_retest", "ultimate"]
+SignalVariant = Literal["primary", "ob_retest", "fvg_retest", "ultimate", "ote_ob_entry"]
 SwingKind = Literal["high", "low"]
 SweepDir = Literal["bsl", "ssl"]
 
@@ -111,3 +111,8 @@ class Signal:
     ob: OrderBlock | None = None
     fvg: FVG | None = None
     equilibrium: Equilibrium | None = None
+    # Conviction-Score (Bot/Conviction-Score.md)
+    conviction_score: int | None = None
+    conviction_grade: str | None = None   # "A" | "B" | "skip" (skip wird gar nicht returned)
+    size_multiplier: float = 1.0          # 1.0 für A, 0.5 für B, 0.0 für skip (filtered)
+    adx_regime: str | None = None         # "trending" | "uncertain" | "ranging"

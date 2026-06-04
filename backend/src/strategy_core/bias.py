@@ -1,24 +1,23 @@
-"""Daily-Bias = Richtung des jüngsten Daily-BoS.
+"""Daily-Bias + Multi-TF-Confluence (Bot/Bias-Detection.md + Dayli Bias.md).
 
-Quelle: Trading/Dayli Bias.md + Trading/BOS.md
+Daily-Bias = Richtung des jüngsten Daily-BoS.
+Multi-TF-Confluence: H4-Bias aus dem 4h-Chart als Bestätigung oder Retracement-Marker.
 
-**Algorithmus** (deterministisch, ohne State-Machine):
+H4-Aligned mit Daily → höchste Conviction (volle Range-TPs erlaubt).
+H4 dreht gegen Daily → "Retracement-Setup" (immer noch tradebar in Daily-Richtung
+auf Lower-TF-Trigger, aber kürzere TPs und reduzierte Conviction).
 
-1. Finde alle Pivots im Daily.
-2. Für jeden Pivot, finde den ERSTEN nachfolgenden Bar dessen Body-Close den
-   Pivot durchbricht (Body = max/min von open & close, nicht Wick).
-3. Sammle alle solchen (Pivot, BreakerBar)-Paare; der JÜNGSTE BreakerBar ist
-   der aktive BoS.
-4. Bias-Richtung = Richtung dieses BoS.
-
-Edge-Case: Keine Pivots oder kein Pivot wurde je durchbrochen → Bias `neutral`.
+Algorithmus (gleich für Daily und H4):
+1. Finde alle Pivots im Frame.
+2. Für jeden Pivot, finde den ersten nachfolgenden Bar mit Body-Close jenseits.
+3. Der jüngste BreakerBar bestimmt den aktiven BoS und damit den Bias.
 """
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
 
-from ._types import Bias
+from ._types import Bias, BiasDir
 from .pivots import find_pivots
 
 
@@ -64,3 +63,40 @@ def compute_bias(
             )
 
     return best_bias if best_bias is not None else Bias(direction="neutral")
+
+
+def resample_to_4h(df_1h: pd.DataFrame) -> pd.DataFrame:
+    """Aggregiert 1h-Bars zu 4h. Sessions-aligned auf 00/04/08/12/16/20 UTC."""
+    if df_1h.empty:
+        return df_1h
+    agg = df_1h.resample("4h").agg({
+        "open": "first", "high": "max", "low": "min", "close": "last",
+        "volume": "sum" if "volume" in df_1h.columns else "max",
+    }).dropna()
+    return agg
+
+
+def compute_h4_bias(df_1h: pd.DataFrame) -> BiasDir:
+    """Vereinfachter H4-Bias: BoS auf resamplten 4h-Bars."""
+    df_4h = resample_to_4h(df_1h)
+    if len(df_4h) < 10:
+        return "neutral"
+    return compute_bias(df_4h, n_left=2, n_right=2).direction
+
+
+def multi_tf_confluence(daily_bias: BiasDir, h4_bias: BiasDir) -> dict:
+    """Confluence-Klassifikation aus Daily + H4 (Dayli Bias.md Tabelle).
+
+    aligned   → beide gleich, voller Conviction
+    retrace   → daily klar, h4 entgegen oder neutral → Retracement-Setup (kürzere TPs)
+    no_daily  → kein klarer Daily-Bias → kein Trade
+    """
+    if daily_bias == "neutral":
+        return {"label": "no_daily", "aligned": False, "size_factor": 0.0}
+    if h4_bias == daily_bias:
+        return {"label": "aligned", "aligned": True, "size_factor": 1.0}
+    if h4_bias == "neutral":
+        # Daily klar, H4 unklar → moderate Conviction
+        return {"label": "h4_neutral", "aligned": False, "size_factor": 0.75}
+    # H4 dreht aktiv gegen Daily → Retracement-Setup (laut Vault gültig auf LTF-Trigger)
+    return {"label": "retrace", "aligned": False, "size_factor": 0.5}
