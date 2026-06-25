@@ -138,3 +138,6 @@ class Signal:
     # Confidence-Score (Vault/Bot/Signal-Confidence-Scoring.md)
     confidence: float | None = None       # 0.0–1.0 (4-Faktoren-Score)
     confidence_tier: str | None = None    # "skip" | "reduced" | "normal" | "high"
+    # Ensemble-Voting (Bot/Ensemble-Entry-Signals.md): 3-voter consensus check
+    ensemble_voters: list[str] | None = None  # ["OB"] or ["OB", "FVG"] etc.
+    ensemble_grade: str | None = None    # "STRONG" (≥2 voters) | "WEAK" (1 voter) | "SKIP"

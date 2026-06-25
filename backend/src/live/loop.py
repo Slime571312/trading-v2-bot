@@ -23,6 +23,7 @@ from src.brokers.capital_com import CapitalAPIError, CapitalAuthError
 from src.data.fetcher import load_candles
 from src.strategy_core import evaluate as evaluate_signal
 from src.strategy_core.bias import compute_bias
+from src.live.confidence_reeval import re_evaluate_confidence_tier, adjust_position_for_tier
 
 from . import paper_broker
 from .state import (
@@ -269,6 +270,65 @@ async def _do_tick(
                 reason=payload["reason"], equity=payload["equity"],
             )
         else:
+            await push_to_dashboard(payload)
+
+    # ── 2b. Confidence-Tier Re-Evaluation (alle 15min = 180 Ticks à 5s) ─────
+    # Mid-trade: re-check 3 gates (regime, structure, momentum) und adjust
+    # Position-Risk wenn Tier schlecht wird (A→B, B→C, etc.)
+    if tick_count % 180 == 0 and instance.open_trades and not df_1m.empty:
+        reeval_queue: list[dict] = []
+        async with state_lock:
+            try:
+                # Load all TF-bars for gate evaluation
+                bars_for_reeval: dict[str, pd.DataFrame] = {}
+                for tf in ["1d", "1h", "5m", "1m"]:
+                    try:
+                        if tf == "1m":
+                            bars_for_reeval[tf] = df_1m
+                        else:
+                            df_tf = await load_candles(inst_name, tf, bars=50)
+                            if not df_tf.empty:
+                                bars_for_reeval[tf] = df_tf
+                    except Exception as e:
+                        log.debug("%s: %s-bars für re-eval nicht geladen: %s",
+                                 inst_name, tf, str(e)[:50])
+
+                for position in instance.open_trades:
+                    old_tier = position.confidence_tier_at_open or "A"
+                    try:
+                        new_tier = re_evaluate_confidence_tier(position, bars_for_reeval)
+                        if new_tier != old_tier:
+                            log.info(
+                                "Confidence re-eval %s: %s → %s",
+                                position.id, old_tier, new_tier
+                            )
+                            # Adjust position (SL tighter, TP adjusted, etc.)
+                            adjust_position_for_tier(position, new_tier)
+                            instance.append_tick_log(TickLogEntry(
+                                timestamp=_now(),
+                                action="confidence_re_eval",
+                                decision=f"{old_tier} → {new_tier}",
+                                detail=f"gates re-checked, position risk adjusted",
+                                related_trade_id=position.id,
+                            ))
+                            reeval_queue.append({
+                                "type": "position_adjustment",
+                                "instrument": inst_name,
+                                "position_id": position.id,
+                                "action": "confidence_re_eval",
+                                "from_tier": old_tier,
+                                "to_tier": new_tier,
+                                "new_sl": position.sl,
+                            })
+                    except Exception as e:
+                        log.warning("Confidence re-eval error for %s: %s",
+                                   position.id, str(e)[:100])
+                save_state(state)
+            except Exception as e:
+                log.warning("Confidence re-eval batch error: %s", str(e)[:100])
+
+        # Push außerhalb des Locks
+        for payload in reeval_queue:
             await push_to_dashboard(payload)
 
     # ── 3. Engine-Eval für neue Entries (nur alle N Ticks) ──────────

@@ -18,6 +18,7 @@ from . import bias as bias_mod
 from . import confidence as confidence_mod
 from . import conviction as conviction_mod
 from . import crypto_sentiment as crypto_mod
+from . import ensemble as ensemble_mod
 from . import liquidity as liquidity_mod
 from . import news as news_mod
 from . import rr as rr_mod
@@ -337,6 +338,34 @@ def evaluate(
         return None
     _stage("entry_ready")
 
+    # ── Ensemble-Signal-Voting (Bot/Ensemble-Entry-Signals.md) ────────────
+    # 3 independent patterns: Order-Block, FVG-Mitigation, Equilibrium+RSI.
+    # ≥2 agree → STRONG (A-Tier). 1 agrees → WEAK (B-Tier). 0 → SKIP.
+    _ensemble = ensemble_mod.ensemble_evaluate(
+        {
+            "1h": bars.get("1h"),
+            "5m": bars.get("5m"),
+            "1d": bars.get("1d"),
+        },
+        side=bias.direction,
+    )
+    if not _ensemble.has_signal:
+        log.info(
+            "evaluate %s: ensemble voting rejected (no voter agreement, "
+            "variant=%s)",
+            instrument, variant
+        )
+        return None
+    _stage("ensemble_ok")
+
+    # Ensemble confidence multiplier: STRONG=1.0, WEAK=0.7
+    _ensemble_confidence_mult = 1.0 if _ensemble.ensemble_grade == "STRONG" else 0.7
+    log.debug(
+        "evaluate %s: ensemble=%s voters=%s confidence_mult=%.2f",
+        instrument, _ensemble.ensemble_grade, _ensemble.voters,
+        _ensemble_confidence_mult,
+    )
+
     # ── Multi-TP-Staffelung (Vault/Bot/TP-Staffelung.md + ERL-IRL.md) ─────
     # ERL/IRL-Modell: TP1 = nächste FVG-Fill (IRL) zwischen Entry und erstem
     # Pivot, TP2 = dieser Pivot (ERL = Dealing-Range-Boundary), TP3 = entferntester
@@ -401,12 +430,16 @@ def evaluate(
         atr_regime=_vol_regime,
     )
     _confidence, _conf_breakdown, _conf_size_mult = confidence_mod.compute_confidence(_conf_ctx)
+    # Apply ensemble confidence multiplier (STRONG=1.0, WEAK=0.7)
+    _confidence *= _ensemble_confidence_mult
+    _conf_size_mult *= _ensemble_confidence_mult
     if _conf_size_mult == 0.0:
         log.info(
-            "evaluate %s: confidence %.0f%% < 50%% — skip (mtf=%.2f rr=%.2f conv=%.2f reg=%.2f)",
+            "evaluate %s: confidence %.0f%% < 50%% — skip (mtf=%.2f rr=%.2f conv=%.2f reg=%.2f ens=%.2f)",
             instrument, _confidence * 100,
             _conf_breakdown["mtf"], _conf_breakdown["rr"],
             _conf_breakdown["conviction"], _conf_breakdown["regime"],
+            _ensemble_confidence_mult,
         )
         return None
     _size_mult *= _conf_size_mult
@@ -469,4 +502,7 @@ def evaluate(
         weekday=_weekday,
         confidence=float(_confidence),
         confidence_tier=confidence_mod.size_tier_label(_confidence),
+        # Ensemble voting metadata
+        ensemble_voters=_ensemble.voters,
+        ensemble_grade=_ensemble.ensemble_grade,
     )
