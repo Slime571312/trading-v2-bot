@@ -85,6 +85,7 @@ class BotOrchestrator:
                 inst.sweep_lookback = sweep_lookback
 
             inst.running = True
+            inst.was_running = True   # „soll 24/7 laufen bis User stoppt"
             inst.started_at = _now()
             inst.stopped_at = None
             inst.last_error = None
@@ -107,7 +108,13 @@ class BotOrchestrator:
         return results
 
     # ── Stop ────────────────────────────────────────────────────────
-    async def stop(self, instrument: str) -> BotInstance:
+    async def stop(self, instrument: str, preserve_was_running: bool = False) -> BotInstance:
+        """User-Stop (default) löscht `was_running` → kein Auto-Resume.
+
+        `preserve_was_running=True` (für Shutdown/Crash-Pfad): Bot bleibt im
+        State als „soll laufen" markiert. Damit kommt er beim nächsten
+        Backend-Start automatisch wieder hoch.
+        """
         inst = self.state.instances.get(instrument)
         if not inst:
             raise KeyError(f"Instance {instrument} nicht vorhanden")
@@ -116,6 +123,8 @@ class BotOrchestrator:
 
         async with self._state_lock:
             inst.running = False
+            if not preserve_was_running:
+                inst.was_running = False   # explizit beendet → kein Resume
             inst.stopped_at = _now()
             save_state(self.state)
 
@@ -126,20 +135,29 @@ class BotOrchestrator:
                 await task
             except (asyncio.CancelledError, Exception):
                 pass
-        log.info("Bot %s gestoppt (open=%d closed=%d)",
-                 instrument, len(inst.open_trades), len(inst.closed_trades))
+        log.info("Bot %s gestoppt (open=%d closed=%d preserve_resume=%s)",
+                 instrument, len(inst.open_trades), len(inst.closed_trades),
+                 preserve_was_running)
         return inst
 
-    async def stop_all(self) -> list[BotInstance]:
+    async def stop_all(self, preserve_was_running: bool = False) -> list[BotInstance]:
         out = []
         for inst_name in list(self._tasks.keys()):
-            out.append(await self.stop(inst_name))
+            out.append(await self.stop(inst_name, preserve_was_running=preserve_was_running))
         return out
 
     # ── Reset ───────────────────────────────────────────────────────
     async def reset(self, instrument: str) -> BotInstance:
+        """Reset = wirklich frisch. Tuning-Werte (tick_interval, rr_threshold)
+        werden auf die instrument-spezifischen Defaults aus `_fresh_state()`
+        zurückgesetzt, sonst überlebt eine alte Tuner-Konfig den Reset.
+        """
         if self.is_running(instrument):
             await self.stop(instrument)
+
+        from .state import _fresh_state  # lokale Import wegen Zirkularität
+        defaults = _fresh_state().instances.get(instrument)
+
         async with self._state_lock:
             inst = self.state.ensure(instrument)
             inst.closed_trades.clear()
@@ -151,8 +169,15 @@ class BotOrchestrator:
             inst.last_signal_check = None
             inst.started_at = None
             inst.stopped_at = None
+            inst.was_running = False  # Reset löscht Auto-Resume-Flag
+            if defaults is not None:
+                inst.tick_interval_s = defaults.tick_interval_s
+                inst.rr_threshold = defaults.rr_threshold
+                inst.risk_pct = defaults.risk_pct
+                inst.sweep_lookback = defaults.sweep_lookback
             save_state(self.state)
-        log.info("Bot %s zurückgesetzt", instrument)
+        log.info("Bot %s zurückgesetzt (tick=%ds rr=%.1f sweep_lb=%d)",
+                 instrument, inst.tick_interval_s, inst.rr_threshold, inst.sweep_lookback)
         return inst
 
     # ── GitHub Actions Sync ─────────────────────────────────────────
@@ -197,6 +222,9 @@ def get_orchestrator() -> BotOrchestrator:
 
 
 async def shutdown_orchestrator() -> None:
+    """Graceful Backend-Shutdown: stoppt alle Bots, aber `was_running` bleibt
+    True — beim nächsten Backend-Start kommen sie via Auto-Resume zurück.
+    """
     global _orchestrator
     if _orchestrator is not None and _orchestrator.any_running():
-        await _orchestrator.stop_all()
+        await _orchestrator.stop_all(preserve_was_running=True)

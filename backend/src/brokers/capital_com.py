@@ -22,6 +22,7 @@ from typing import Any
 
 import httpx
 
+from src.brokers.circuit_breaker import CircuitOpenError, capital_breaker
 from src.config import config
 
 log = logging.getLogger(__name__)
@@ -132,43 +133,70 @@ async def request(
     werden bis `max_network_retries`-mal mit Backoff 1/2/4 s wiederholt —
     der Bot bleibt dadurch über kurze WiFi-/DNS-Hiccups stabil.
     """
+    # Circuit-Breaker-Gate: bei OPEN sofort raisen, kein HTTP-Roundtrip.
+    # Verhindert dass tausende parallele Tick-Loops Capital während Outages
+    # zumüllen. Cool-off läuft in cb intern; nach Ablauf wird HALF_OPEN-Probe
+    # erlaubt.
+    try:
+        await capital_breaker.before_call()
+    except CircuitOpenError as e:
+        # CircuitOpenError → als CapitalAPIError 503 maskieren, damit
+        # die Caller-Schicht den selben Pfad wie bei normalem 5xx nimmt.
+        raise CapitalAPIError(503, str(e))
+
     session = await get_session(client)
     url = f"{config.capital_base_url}{path}"
 
     res: httpx.Response | None = None
     network_attempt = 0
-    for attempt in range(max_429_retries + 1):
-        try:
-            res = await client.request(method, url, headers=_auth_headers(session),
-                                       params=params, json=json_body)
-        except (httpx.ConnectError, httpx.ReadTimeout, httpx.RemoteProtocolError,
-                httpx.ConnectTimeout, httpx.WriteTimeout) as e:
-            if network_attempt >= max_network_retries:
-                raise CapitalAPIError(599, f"Netzwerk-Fehler nach {network_attempt+1} Versuchen: {e}")
-            wait = 1.0 * (2 ** network_attempt)
-            log.warning("Netz-Fehler bei %s %s (%s) — retry in %.1fs (%d/%d)",
-                        method, path, e, wait, network_attempt + 1, max_network_retries)
-            await asyncio.sleep(wait)
-            network_attempt += 1
-            continue
-        if res.status_code == 401 and retry_on_401:
-            log.warning("401 von Capital → Session refresh + retry %s %s", method, path)
-            invalidate_session()
-            session = await get_session(client)
-            continue
-        if res.status_code == 429 and attempt < max_429_retries:
-            wait = 0.5 * (2 ** attempt)
-            log.info("429 von Capital — backoff %.1fs (Versuch %d/%d) %s",
-                     wait, attempt + 1, max_429_retries, path)
-            await asyncio.sleep(wait)
-            continue
-        break
+    try:
+        for attempt in range(max_429_retries + 1):
+            try:
+                res = await client.request(method, url, headers=_auth_headers(session),
+                                           params=params, json=json_body)
+            except (httpx.TransportError, OSError) as e:
+                # TransportError ist die gemeinsame Basisklasse aller transienten
+                # httpx-Netzfehler (ConnectError, ReadError, ReadTimeout, NetworkError,
+                # RemoteProtocolError, ConnectTimeout, WriteError, WriteTimeout, …).
+                # OSError fängt rohen socket.gaierror der bei Mac-Sleep durchrutschen
+                # kann bevor httpx ihn wrappt. Beide → transient, also retry.
+                if network_attempt >= max_network_retries:
+                    await capital_breaker.on_failure()
+                    raise CapitalAPIError(599, f"Netzwerk-Fehler nach {network_attempt+1} Versuchen: {e}")
+                wait = 1.0 * (2 ** network_attempt)
+                log.warning("Netz-Fehler bei %s %s (%s) — retry in %.1fs (%d/%d)",
+                            method, path, e, wait, network_attempt + 1, max_network_retries)
+                await asyncio.sleep(wait)
+                network_attempt += 1
+                continue
+            if res.status_code == 401 and retry_on_401:
+                log.warning("401 von Capital → Session refresh + retry %s %s", method, path)
+                invalidate_session()
+                session = await get_session(client)
+                continue
+            if res.status_code == 429 and attempt < max_429_retries:
+                wait = 0.5 * (2 ** attempt)
+                log.info("429 von Capital — backoff %.1fs (Versuch %d/%d) %s",
+                         wait, attempt + 1, max_429_retries, path)
+                await asyncio.sleep(wait)
+                continue
+            break
 
-    if res is None:
-        raise CapitalAPIError(599, "Kein Response — alle Netz-Retries fehlgeschlagen")
-    if res.status_code >= 400:
-        raise CapitalAPIError(res.status_code, res.text)
-    return res
+        if res is None:
+            await capital_breaker.on_failure()
+            raise CapitalAPIError(599, "Kein Response — alle Netz-Retries fehlgeschlagen")
+        if res.status_code >= 500:
+            # 5xx zählt als Failure für den Breaker; 4xx (Client-Errors) nicht
+            # — der Server ist ja erreichbar, nur unser Request war falsch.
+            await capital_breaker.on_failure()
+        elif res.status_code < 400:
+            await capital_breaker.on_success()
+        if res.status_code >= 400:
+            raise CapitalAPIError(res.status_code, res.text)
+        return res
+    except CapitalAuthError:
+        # Auth-Fehler ist kein Breaker-Trigger (Credentials-Problem, nicht Capital-Outage)
+        raise
 
 
 # ─── Convenience-Wrapper für die Routen, die wir in Etappe 1 brauchen ─────

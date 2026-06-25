@@ -16,6 +16,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+_BERLIN = ZoneInfo("Europe/Berlin")
 
 
 @dataclass
@@ -31,13 +34,82 @@ class TradeLimitsConfig:
     initial_capital: float = 10_000.0
 
 
+# BTC braucht strengere Limits: höhere Spreads, mehr Noise, bei 24/7 Tendenz zum
+# Over-Trading. Vault/Bot/Crypto-Sentiment.md + TP-Strategy.md.
+BTC_LIMITS = TradeLimitsConfig(
+    max_trades_per_day=3,
+    max_trades_per_session=1,
+    max_trades_per_pair_per_day=3,
+    daily_loss_limit_pct=1.5,
+    weekly_loss_limit_pct=4.0,
+    consecutive_loss_pause=2,
+    revenge_cooldown_minutes=120,
+)
+
+
+def get_limits_for(instrument: str, initial_capital: float) -> TradeLimitsConfig:
+    """Liefert die Limit-Config für ein Instrument — BTC strikter als Indizes."""
+    if instrument == "BTC":
+        cfg = TradeLimitsConfig(**{
+            k: v for k, v in BTC_LIMITS.__dict__.items() if k != "initial_capital"
+        })
+        cfg.initial_capital = initial_capital
+        return cfg
+    return TradeLimitsConfig(initial_capital=initial_capital)
+
+
+# Portfolio-Korrelations-Cluster: Instrumente in derselben Gruppe bewegen
+# sich gemeinsam (z.B. US-Indizes ~0.85 Korrelation auf Daily). Wenn alle drei
+# gleichzeitig short gehen, ist das *ein* Risk-Event, nicht drei.
+CORRELATION_CLUSTERS: dict[str, list[str]] = {
+    "INDICES": ["DE40", "NASDAQ", "SP500"],
+}
+
+# Max gleichzeitig offene Trades pro Cluster. 2/3 lässt Diversifikation zu,
+# verhindert aber Portfolio-Concentration.
+MAX_OPEN_PER_CLUSTER: dict[str, int] = {
+    "INDICES": 2,
+}
+
+
+def correlation_gate_blocked(
+    instrument: str,
+    open_instruments: list[str],
+) -> tuple[bool, str | None]:
+    """Returns (blocked, reason) — True wenn der Cluster bereits am Limit ist.
+
+    `open_instruments`: Liste der Instrument-Namen mit gerade offenen Trades
+    (ohne `instrument` selbst — der will ja gerade einen Trade aufmachen).
+    """
+    for cluster_name, members in CORRELATION_CLUSTERS.items():
+        if instrument not in members:
+            continue
+        cluster_open = [n for n in open_instruments if n in members]
+        max_open = MAX_OPEN_PER_CLUSTER.get(cluster_name, 99)
+        if len(cluster_open) >= max_open:
+            return True, (
+                f"correlation_cluster_{cluster_name.lower()}_full:"
+                f"{len(cluster_open)}/{max_open} ({','.join(cluster_open)})"
+            )
+    return False, None
+
+
 def _session_key(ts: datetime) -> str:
-    """Welche Session ist der Timestamp? london | ny | offhours."""
-    # ts kommt UTC; London = 07:00-10:00 UTC, NY = 13:30-16:00 UTC (CEST-Sommerzeit)
-    h, m = ts.hour, ts.minute
-    if 7 <= h < 10:
+    """Welche Session ist der Timestamp? london | ny | offhours.
+
+    Klassifikation in Berlin-Zeit (DST-sicher), konsistent mit
+    `sessions.is_in_session` für Indizes:
+      London = 09:00-12:00 Berlin
+      NY     = 15:30-18:00 Berlin
+    Vorher: hardcoded auf UTC-Sommerzeit → im Winter um 1h verschoben.
+    """
+    if ts.tzinfo is None:
+        ts = ts.replace(tzinfo=timezone.utc)
+    berlin = ts.astimezone(_BERLIN)
+    h, m = berlin.hour, berlin.minute
+    if 9 <= h < 12:
         return "london"
-    if (h == 13 and m >= 30) or (14 <= h < 16):
+    if (h == 15 and m >= 30) or (16 <= h < 18):
         return "ny"
     return "offhours"
 

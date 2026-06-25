@@ -100,7 +100,7 @@ class Signal:
     side: Side
     entry: float
     sl: float
-    tp: float
+    tp: float           # finales (= weitestes) TP — Backward-Compat
     rr: float
     variant: SignalVariant
     htf_used: str
@@ -116,3 +116,25 @@ class Signal:
     conviction_grade: str | None = None   # "A" | "B" | "skip" (skip wird gar nicht returned)
     size_multiplier: float = 1.0          # 1.0 für A, 0.5 für B, 0.0 für skip (filtered)
     adx_regime: str | None = None         # "trending" | "uncertain" | "ranging"
+    # Multi-TP-Staffelung (Vault/Bot/TP-Staffelung.md, TP-Strategy.md)
+    # tp1 = nächste IRL (FVG/Pivot), tp2 = ERL (BSL/SSL-Cluster), tp = HTF-Draw
+    # Wenn tp1/tp2 None → Engine konnte keine 3-Tier-Struktur bauen, Loop fällt
+    # auf alte 2-Tier-Logik (halbweg + voll) zurück.
+    tp1: float | None = None
+    tp2: float | None = None
+    # Splits müssen zu 1.0 summieren. Default 50/50/0 = B-Setup ohne Runner.
+    # A-Setup mit HTF-Draw setzt 40/40/20.
+    pct1: float = 0.5
+    pct2: float = 0.5
+    pct3: float = 0.0
+    # Trade-Journal-Tags (Vault/Bot/Trade-Journal.md): Snapshot der Kontext-Variablen
+    # zum Zeitpunkt des Entries — ermöglicht später Performance-Attribution nach
+    # Session, Vol-Regime, Wochentag, Conviction-Score etc.
+    session_label: str | None = None      # london / ny / crypto-hours / closed / weekend / holiday
+    atr_regime: str | None = None         # low / normal / high (für regime-Bucketing)
+    atr_pct: float | None = None          # rohe ATR%/Close für quantitative Auswertung
+    vol_size_factor: float | None = None  # kontinuierlicher Vol-Faktor (z.B. 0.85)
+    weekday: int | None = None            # 0=Montag, 6=Sonntag (Power-of-3 Bucketing)
+    # Confidence-Score (Vault/Bot/Signal-Confidence-Scoring.md)
+    confidence: float | None = None       # 0.0–1.0 (4-Faktoren-Score)
+    confidence_tier: str | None = None    # "skip" | "reduced" | "normal" | "high"

@@ -22,7 +22,7 @@ from src.live.state import (
     BotInstance, BotState, TickLogEntry,
     load_state, save_state, _now,
 )
-from src.live.trade_limits import TradeLimitsConfig, can_trade
+from src.live.trade_limits import can_trade, correlation_gate_blocked, get_limits_for
 from src.strategy_core import evaluate as evaluate_signal
 from src.strategy_core.bias import compute_bias
 
@@ -37,25 +37,17 @@ INSTRUMENTS = ["DE40", "NASDAQ", "SP500", "BTC"]
 LIVE_TFS = ["1d", "1h", "30m", "15m", "5m", "1m"]
 
 
-async def _tick(instance: BotInstance) -> None:
+async def _tick(instance: BotInstance, others_open: list[str] | None = None) -> None:
     """Vollständiger Tick für ein Instrument: SL/TP-Check + Signal-Eval."""
     inst = instance.instrument
 
-    # 1. 1m-Bars laden — genug um seit Trade-Öffnung alles abzudecken (Catch-up)
+    # 1. 1m-Bars laden — NUR jüngste Bars, kein historisches Catch-up.
+    # Live = nur die letzten Minuten. Backfill seit Trade-Öffnung würde TP/SL
+    # aus der Vergangenheit als „jetzt eingetreten" buchen → de facto Lookahead.
     df_1m = pd.DataFrame()
     latest_bar = None
     try:
-        # Wie viele 1m-Bars seit dem ältesten offenen Trade?
-        bars_needed = 500  # ~8h Default
-        if instance.open_trades:
-            from datetime import timezone
-            import math
-            oldest = min(t.open_time for t in instance.open_trades)
-            # Sekunden seit Trade-Öffnung + 10% Puffer, in Bars (1 Bar = 1 Min)
-            now_utc = _now()
-            age_s = (now_utc - oldest).total_seconds()
-            bars_needed = min(1000, max(50, math.ceil(age_s / 60) + 20))
-        df_1m = await load_candles(inst, "1m", bars=bars_needed, refresh=True)
+        df_1m = await load_candles(inst, "1m", bars=5, refresh=True)
         if not df_1m.empty:
             latest_bar = df_1m.iloc[-1]
     except (CapitalAuthError, CapitalAPIError) as e:
@@ -74,18 +66,37 @@ async def _tick(instance: BotInstance) -> None:
                         timestamp=trade.partial_close_time or _now(),
                         action="close", decision="partial_tp1",
                         variant=trade.variant,
-                        detail=(f"50% @ {trade.tp1:.2f} → +{ev['pnl']:.2f}, "
-                                f"SL→BE ({trade.entry:.2f})"),
+                        detail=(f"{trade.pct1*100:.0f}% @ {trade.tp1:.2f} → "
+                                f"+{ev['pnl']:.2f}, SL→BE ({trade.entry:.2f})"),
                         related_trade_id=trade.id,
                     ))
-                    log.info("%s PARTIAL_TP1 %s 50%% @ %.2f → +%.2f, SL→BE",
-                             inst, trade.side, trade.tp1, ev["pnl"])
+                    log.info("%s PARTIAL_TP1 %s %.0f%% @ %.2f → +%.2f, SL→BE",
+                             inst, trade.side, trade.pct1*100, trade.tp1, ev["pnl"])
+                elif ev["kind"] == "partial_tp2":
+                    instance.equity += ev["pnl"]
+                    instance.append_tick_log(TickLogEntry(
+                        timestamp=trade.partial_close_time or _now(),
+                        action="close", decision="partial_tp2",
+                        variant=trade.variant,
+                        detail=(f"{trade.pct2*100:.0f}% @ {trade.tp2:.2f} → "
+                                f"+{ev['pnl']:.2f}, SL→TP1 ({trade.tp1:.2f}) [Lock-Profit]"),
+                        related_trade_id=trade.id,
+                    ))
+                    log.info("%s PARTIAL_TP2 %s %.0f%% @ %.2f → +%.2f, SL→TP1",
+                             inst, trade.side, trade.pct2*100, trade.tp2, ev["pnl"])
                 elif ev["kind"] == "full_close":
+                    # Idempotenz: derselbe Trade darf nur 1× in closed_trades.
+                    # Race-Schutz gegen parallele GH-Runs / lokalen Loop.
+                    if any(c.id == trade.id for c in instance.closed_trades):
+                        log.warning("%s: Trade %s schon geschlossen — skip duplicate close",
+                                    inst, trade.id)
+                        full_closed = True
+                        continue
                     closed = paper_broker.close_position(
                         trade, ev["exit"], ev["bar"], ev["reason"], close_time=ev["ts"],
                     )
                     instance.equity += closed.pnl_abs
-                    instance.closed_trades.append(closed)
+                    instance.append_closed_trade(closed)
                     # Im Anzeige-PnL die TP1-Teilrealisierung mit aufaddieren
                     total_pnl = closed.pnl_abs + trade.partial_pnl
                     risk_basis = abs(trade.original_sl - trade.entry) * (trade.original_size or trade.size)
@@ -117,7 +128,7 @@ async def _tick(instance: BotInstance) -> None:
 
     # Volle Trade-Limits-Pipeline: Daily/Weekly Loss, Consecutive-SL, Revenge-Cooldown,
     # Max-Trades-per-Day/Session/Pair
-    cfg = TradeLimitsConfig(initial_capital=instance.initial_capital)
+    cfg = get_limits_for(inst, instance.initial_capital)
     allowed, reason = can_trade(_now(), inst, instance.equity,
                                  instance.closed_trades, cfg=cfg)
     if not allowed:
@@ -128,7 +139,25 @@ async def _tick(instance: BotInstance) -> None:
         log.info("%s Trade-Limit: %s", inst, reason)
         return
 
+    # Portfolio-Korrelations-Gate
+    if others_open is not None:
+        corr_blocked, corr_reason = correlation_gate_blocked(inst, others_open)
+        if corr_blocked:
+            instance.append_tick_log(TickLogEntry(
+                timestamp=_now(), action="skip", decision="correlation_gate",
+                detail=corr_reason or "",
+            ))
+            log.info("%s Korrelations-Gate: %s", inst, corr_reason)
+            return
+
     try:
+        # External-Data-Refresh (async, non-blocking, idempotent).
+        from src.strategy_core import news as news_mod
+        from src.strategy_core import crypto_sentiment as crypto_mod
+        await news_mod.refresh_calendar_async()
+        if inst == "BTC":
+            await crypto_mod.refresh_funding_async()
+
         bars: dict[str, pd.DataFrame] = {}
         for tf in LIVE_TFS:
             try:
@@ -146,11 +175,27 @@ async def _tick(instance: BotInstance) -> None:
             ))
             return
 
+        # SMT-Reference-Bars (Vault/Bot/Conviction-Score.md)
+        from src.strategy_core import smt as smt_mod
+        ref_bars: dict[str, pd.DataFrame] | None = None
+        ref_inst = smt_mod.get_reference_instrument(inst)
+        if ref_inst:
+            ref_bars = {}
+            for htf in ("1h", "30m", "15m"):
+                try:
+                    df_ref = await load_candles(ref_inst, htf, bars=200)
+                    if not df_ref.empty:
+                        ref_bars[htf] = df_ref
+                except (CapitalAuthError, CapitalAPIError) as e:
+                    log.debug("%s: ref-bars %s/%s nicht ladbar: %s",
+                              inst, ref_inst, htf, e)
+
         bias = compute_bias(bars["1d"])
         signal = evaluate_signal(
             inst, bars,
             rr_threshold=instance.rr_threshold,
             sweep_lookback_bars=instance.sweep_lookback,
+            ref_bars=ref_bars,
         )
 
         if signal is None:
@@ -227,8 +272,11 @@ async def _tick_all(state: BotState) -> bool:
     for instrument in INSTRUMENTS:
         instance = state.ensure(instrument)
         open_before = len(instance.open_trades)
+        # Andere Instances mit offenen Trades — für den Korrelations-Gate.
+        others_open = [n for n in INSTRUMENTS
+                       if n != instrument and state.ensure(n).open_trades]
         try:
-            await _tick(instance)
+            await _tick(instance, others_open=others_open)
             instance.last_tick = _now()
             if instance.last_error:
                 instance.last_error = None

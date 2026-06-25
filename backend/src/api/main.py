@@ -57,10 +57,42 @@ async def lifespan(app: FastAPI):
     await cache.start(instruments=DEFAULT_INSTRUMENTS, refresh_interval_s=60)
     log_app.info("SignalCache Background-Task gestartet")
 
+    # ── Startup-Recovery (Vault/Bot/Startup-Recovery.md) ─────────────────
+    # 4 Gates VOR Auto-Resume: Config-Validation, Schema-Check,
+    # Position-Reconciliation (DB ↔ Capital), Pre-Flight Capital-Ping.
+    # Auto-Resume passiert nur wenn alle 4 Gates grün sind.
+    from src.live import startup as startup_mod
+    startup_result = await startup_mod.run_startup_sequence(orch)
+    startup_mod.set_last_result(startup_result)
+
+    if not startup_result.can_auto_resume:
+        log_app.warning(
+            "Startup-Recovery FAIL — Auto-Resume DEAKTIVIERT. config=%s schema=%s reconcile=%s capital=%s",
+            startup_result.config_ok, startup_result.schema_ok,
+            startup_result.reconciliation_ok, startup_result.capital_ok,
+        )
+        # User muss manuell über das Dashboard starten — sieht im /health
+        # warum Auto-Resume nicht griff.
+    else:
+        # Auto-Resume: Instanzen die zuletzt liefen wieder anwerfen.
+        to_resume = [n for n, i in orch.state.instances.items() if i.was_running]
+        for inst_name in to_resume:
+            try:
+                await orch.start(inst_name)
+                log_app.info("Auto-Resume %s — war zuletzt running", inst_name)
+            except Exception as e:
+                log_app.warning("Auto-Resume %s fehlgeschlagen: %s", inst_name, e)
+
     async def _gh_actions_sync():
-        """Alle 60s: GitHub-State holen — nur wenn GitHub neuer als lokal."""
+        """Alle 60s: GitHub-State holen — nur wenn GitHub neuer UND schema-kompatibel.
+
+        Schema-Version-Gate: wenn der Remote-State eine ÄLTERE Schema-Version hat
+        (z.B. GH-Workflow läuft noch mit altem Code), wird er NICHT übernommen.
+        Sonst werden alte Trades mit fehlenden Feldern (tp1=None, original_size=None)
+        in den lokalen State gespült und der Bot duplikatet sie endlos.
+        """
         import subprocess, json as _json
-        from src.live.state import STATE_FILE
+        from src.live.state import STATE_FILE, STATE_SCHEMA_VERSION
         repo_root = Path(__file__).resolve().parents[3]
 
         def _latest_tick(data):
@@ -80,29 +112,82 @@ async def lifespan(app: FastAPI):
                 )
                 if res.returncode == 0:
                     remote_data = _json.loads(res.stdout)
-                    local_data = _json.loads(STATE_FILE.read_text())
-                    if _latest_tick(remote_data) > _latest_tick(local_data):
+                    remote_version = remote_data.get("schema_version", 0)
+                    if remote_version < STATE_SCHEMA_VERSION:
+                        log_app.warning(
+                            "GH-Sync: Remote schema=%d < local=%d — IGNORIERT "
+                            "(GH-Workflow läuft mit altem Code, pushen Sie zuerst die Fixes).",
+                            remote_version, STATE_SCHEMA_VERSION,
+                        )
+                    elif _latest_tick(remote_data) > _latest_tick(STATE_FILE.exists() and _json.loads(STATE_FILE.read_text()) or {}):
                         STATE_FILE.write_text(res.stdout)
                         log_app.debug("GH-Sync: Remote-State ist neuer — übernommen")
                     else:
                         log_app.debug("GH-Sync: Lokaler State ist aktuell — behalten")
-            except Exception:
-                pass
+            except Exception as e:
+                log_app.debug("GH-Sync Fehler (ignoriert): %s", e)
             orch.reload_from_file()
 
     sync_task = asyncio.create_task(_gh_actions_sync(), name="gh_state_sync")
     log_app.info("GitHub-Actions-State-Sync gestartet (60s Intervall)")
 
+    # ── Graceful Shutdown (Vault/Bot/Graceful-Shutdown.md) ──────────────
+    # SIGTERM von launchd / Docker und SIGINT von Ctrl+C lösen denselben
+    # Shutdown-Pfad aus wie ein regulärer Lifespan-Exit. Ohne Handler
+    # würde Uvicorn ohne Vorwarnung sterben — mitten in save_state()
+    # = State-Korruption.
+    import signal
+    from src.live.state import save_state
+
+    shutdown_event = asyncio.Event()
+
+    def _signal_handler(signame: str) -> None:
+        log_app.warning("Signal %s erhalten — leite Graceful Shutdown ein", signame)
+        shutdown_event.set()
+
+    loop_running = asyncio.get_event_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        try:
+            loop_running.add_signal_handler(sig, _signal_handler, sig.name)
+        except (NotImplementedError, RuntimeError):
+            # Windows / pytest event-loops haben kein add_signal_handler
+            pass
+
+    async def _shutdown_watchdog():
+        await shutdown_event.wait()
+        log_app.info("Shutdown-Watchdog aktiv — persistiere State, stoppe Tasks")
+        try:
+            save_state(orch.state)
+            log_app.info("State sofort persistiert (vor Task-Cancel)")
+        except Exception as e:
+            log_app.error("State-Persist beim Shutdown gescheitert: %s", e)
+
+    watchdog_task = asyncio.create_task(_shutdown_watchdog(), name="shutdown_watchdog")
+
     yield
 
-    sync_task.cancel()
+    # Shutdown-Phase: in dieser Reihenfolge
+    # 1. State sofort persistieren (falls Watchdog noch nicht durch)
     try:
-        await sync_task
-    except asyncio.CancelledError:
-        pass
+        save_state(orch.state)
+    except Exception as e:
+        log_app.error("Final save_state fehlgeschlagen: %s", e)
+    # 2. Background-Tasks stoppen
+    for task in (sync_task, watchdog_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    # 3. SignalCache + Orchestrator (cancelt alle Tick-Loops sauber)
     await cache.stop()
     await shutdown_orchestrator()
-    log_app.info("Backend-Shutdown — Bot + Cache gestoppt, State persistiert")
+    # 4. Letzter Persist nach Tick-Loop-Cancel
+    try:
+        save_state(orch.state)
+    except Exception as e:
+        log_app.error("Post-shutdown save_state fehlgeschlagen: %s", e)
+    log_app.info("Backend-Shutdown — Bot + Cache gestoppt, State 2× persistiert")
 
 
 app = FastAPI(
@@ -213,6 +298,59 @@ def health() -> HealthResponse:
         bot_running=orch.any_running(),
         broker_connected=config.broker_configured,
     )
+
+
+@app.get("/health/detailed")
+def health_detailed() -> dict:
+    """Vollständiger Status: per-Instrument equity/last_tick/stage, Circuit-State,
+    Startup-Recovery-Ergebnis, Telegram-Konfig.
+
+    Für externes Monitoring (uptime-robot etc.) und Frontend-Debug-Anzeige.
+    """
+    from src.brokers.circuit_breaker import capital_breaker
+    from src.live import startup as startup_mod
+    orch = get_orchestrator()
+    now = datetime.now(timezone.utc)
+
+    def _ago(ts) -> float | None:
+        if ts is None:
+            return None
+        return (now - ts).total_seconds()
+
+    startup_result = startup_mod.get_last_result()
+    return {
+        "timestamp_utc": now.isoformat(),
+        "version": "0.3.0",
+        "bot_running_any": orch.any_running(),
+        "broker_configured": config.broker_configured,
+        "telegram_configured": bool(config.telegram_bot_token and config.telegram_chat_id),
+        "circuit_breaker": capital_breaker.snapshot(),
+        "startup_recovery": {
+            "timestamp": startup_result.timestamp if startup_result else None,
+            "can_auto_resume": startup_result.can_auto_resume if startup_result else None,
+            "config_ok": startup_result.config_ok if startup_result else None,
+            "config_errors": startup_result.config_errors if startup_result else [],
+            "schema_ok": startup_result.schema_ok if startup_result else None,
+            "schema_message": startup_result.schema_message if startup_result else "",
+            "reconciliation_ok": startup_result.reconciliation_ok if startup_result else None,
+            "reconciliation_message": startup_result.reconciliation_message if startup_result else "",
+            "capital_ok": startup_result.capital_ok if startup_result else None,
+            "capital_message": startup_result.capital_message if startup_result else "",
+        } if startup_result else None,
+        "instances": {
+            inst.instrument: {
+                "running": inst.running,
+                "was_running": inst.was_running,
+                "equity": round(inst.equity, 2),
+                "open_trades": len(inst.open_trades),
+                "closed_trades": len(inst.closed_trades),
+                "setup_stage": inst.setup_stage,
+                "last_tick_ago_s": _ago(inst.last_tick),
+                "last_error": inst.last_error,
+            }
+            for inst in orch.state.instances.values()
+        },
+    }
 
 
 @app.get("/config", response_model=ConfigResponse)
@@ -694,6 +832,7 @@ class TickLogOut(BaseModel):
 class BotInstanceResponse(BaseModel):
     instrument: str
     running: bool
+    was_running: bool = False     # 24/7-Auto-Resume-Flag (siehe state.py)
     started_at: str | None
     stopped_at: str | None
     last_tick: str | None
@@ -866,6 +1005,16 @@ class BotStatsResponse(BaseModel):
     last_trade_time: str | None
     equity_curve: list[dict]  # [{time, equity, pnl_cum}, ...]
     variant_breakdown: dict[str, dict]  # variant → {n, win_rate, avg_r}
+    # Trade-Journal Performance-Attribution (Vault/Bot/Trade-Journal.md)
+    session_breakdown: dict[str, dict] = {}        # "london"/"ny"/... → {n, win_rate, avg_r, sum_pnl}
+    atr_regime_breakdown: dict[str, dict] = {}     # "low"/"normal"/"high" → {n, win_rate, avg_r, sum_pnl}
+    weekday_breakdown: dict[str, dict] = {}        # "0"-"6" → {n, win_rate, avg_r, sum_pnl}
+    confidence_tier_breakdown: dict[str, dict] = {}  # "reduced"/"normal"/"high" → {n, win_rate, avg_r, sum_pnl}
+    # Risk-Adjusted Metriken (Vault/Bot/Performance-Metriken.md) — None bei <3 Trades
+    sortino: float | None = None
+    calmar: float | None = None
+    omega: float | None = None
+    max_drawdown_pct: float | None = None
     last_error: str | None
     last_tick: str | None
     last_signal_check: str | None
@@ -924,8 +1073,11 @@ def _compute_stats(inst) -> BotStatsResponse:
     }]
     cum_pnl = 0.0
     for t in sorted_closed:
-        eq += t.pnl_abs
-        cum_pnl += t.pnl_abs
+        # total_pnl deckt Partials + Runner. Legacy-Records (vor Multi-TP-Fix)
+        # haben total_pnl == pnl_abs, sind also rückwärtskompatibel.
+        trade_pnl = t.total_pnl if t.total_pnl else t.pnl_abs
+        eq += trade_pnl
+        cum_pnl += trade_pnl
         curve.append({
             "time": t.close_time.isoformat(),
             "equity": round(eq, 2),
@@ -948,6 +1100,44 @@ def _compute_stats(inst) -> BotStatsResponse:
         }
         for name, v in variants.items()
     }
+
+    # Trade-Journal Attribution (Vault/Bot/Trade-Journal.md)
+    # Groupby Session / ATR-Regime / Wochentag aus den Tag-Feldern.
+    # Records ohne Tags (Legacy vor Sprint A) fallen in den "unknown"-Bucket.
+    def _group_by(closed_list, key_fn):
+        groups: dict[str, dict] = {}
+        for t in closed_list:
+            key = key_fn(t) or "unknown"
+            g = groups.setdefault(str(key), {"n": 0, "wins": 0, "sum_r": 0.0, "sum_pnl": 0.0})
+            g["n"] += 1
+            if t.r_multiple > 0:
+                g["wins"] += 1
+            g["sum_r"] += t.r_multiple
+            g["sum_pnl"] += (t.total_pnl if t.total_pnl else t.pnl_abs)
+        return {
+            name: {
+                "n": v["n"],
+                "win_rate": round(v["wins"] / v["n"], 3) if v["n"] else None,
+                "avg_r": round(v["sum_r"] / v["n"], 3) if v["n"] else None,
+                "sum_pnl": round(v["sum_pnl"], 2),
+            }
+            for name, v in groups.items()
+        }
+
+    session_breakdown = _group_by(closed, lambda t: t.session_at_open)
+    atr_regime_breakdown = _group_by(closed, lambda t: t.atr_regime_at_open)
+    weekday_breakdown = _group_by(closed, lambda t: t.weekday_at_open)
+    confidence_tier_breakdown = _group_by(closed, lambda t: t.confidence_tier_at_open)
+
+    # Risk-Adjusted Metriken (Sortino/Calmar/Omega) auf R-Multiple-Serie +
+    # Equity-Curve. Liefert None bei < 3 Trades (statistisch nicht aussagekräftig).
+    from src.live import perf_metrics
+    _equity_values = [c["equity"] for c in curve]
+    _perf = perf_metrics.compute_all(rs, _equity_values)
+    sortino_val = round(_perf["sortino"], 3) if _perf["sortino"] is not None else None
+    calmar_val = round(_perf["calmar"], 3) if _perf["calmar"] is not None else None
+    omega_val = round(_perf["omega"], 3) if _perf["omega"] is not None else None
+    max_dd_pct_val = round(_perf["max_drawdown_pct"], 2) if _perf["max_drawdown_pct"] is not None else None
 
     return BotStatsResponse(
         instrument=inst.instrument,
@@ -976,6 +1166,14 @@ def _compute_stats(inst) -> BotStatsResponse:
         last_trade_time=last_trade_time,
         equity_curve=curve,
         variant_breakdown=variant_breakdown,
+        session_breakdown=session_breakdown,
+        atr_regime_breakdown=atr_regime_breakdown,
+        weekday_breakdown=weekday_breakdown,
+        confidence_tier_breakdown=confidence_tier_breakdown,
+        sortino=sortino_val,
+        calmar=calmar_val,
+        omega=omega_val,
+        max_drawdown_pct=max_dd_pct_val,
         last_error=inst.last_error,
         last_tick=inst.last_tick.isoformat() if inst.last_tick else None,
         last_signal_check=inst.last_signal_check.isoformat() if inst.last_signal_check else None,
@@ -992,6 +1190,32 @@ def bot_stats(instrument: InstrumentName) -> BotStatsResponse:
     orch = get_orchestrator()
     inst = orch.state.ensure(instrument)
     return _compute_stats(inst)
+
+
+@app.get("/bot/{instrument}/journal")
+def bot_journal(
+    instrument: InstrumentName,
+    min_sample: int = Query(default=3, ge=1, le=50),
+) -> dict:
+    """Self-Diagnose des Bots (Vault/Bot/Self-Diagnose.md).
+
+    Liest die Trade-Journal-Tags (variant, session, atr_regime, weekday,
+    confidence_tier) und sucht systematische Schwäche-Muster — Gruppen die
+    mind. `min_sample` Trades haben und negative Expectancy oder niedrige WR.
+
+    Rückgabe: Patterns sortiert nach Severity + Klartext-Summary.
+    """
+    from src.live.self_diagnose import build_diagnose_report
+    from dataclasses import asdict
+    orch = get_orchestrator()
+    inst = orch.state.ensure(instrument)
+    report = build_diagnose_report(instrument, inst.closed_trades, min_sample=min_sample)
+    return {
+        "instrument": report.instrument,
+        "total_trades": report.total_trades,
+        "summary": report.summary,
+        "patterns": [asdict(p) for p in report.patterns],
+    }
 
 
 @app.post("/bot/start-all", response_model=BotOverviewResponse)
@@ -1026,7 +1250,7 @@ async def bot_sync_from_github() -> dict:
     Wenn lokale Version aktueller, wird sie behalten (und gepusht).
     """
     import subprocess, json as _json
-    from src.live.state import STATE_FILE
+    from src.live.state import STATE_FILE, STATE_SCHEMA_VERSION
     orch = get_orchestrator()
     if orch.any_running():
         return {"synced": False, "message": "Übersprungen — lokale Bots laufen noch"}
@@ -1057,6 +1281,19 @@ async def bot_sync_from_github() -> dict:
     try:
         remote_data = _json.loads(res.stdout)
         local_data = _json.loads(STATE_FILE.read_text())
+
+        # Schema-Gate: Remote mit älterem Schema NIE übernehmen (würde Trades
+        # mit fehlenden Feldern reinholen und Idempotenz-Check umgehen).
+        remote_version = remote_data.get("schema_version", 0)
+        if remote_version < STATE_SCHEMA_VERSION:
+            orch.reload_from_file()
+            return {
+                "synced": False,
+                "message": (
+                    f"Remote schema_version={remote_version} < local={STATE_SCHEMA_VERSION} — "
+                    "verworfen. GH-Workflow läuft noch mit altem Code."
+                ),
+            }
 
         def _latest_tick(data):
             ticks = [v.get("last_tick") for v in data.get("instances", {}).values() if v.get("last_tick")]
@@ -1397,6 +1634,103 @@ def tuner_run_detail(run_id: str) -> TunerRunOut:
     if not run:
         raise HTTPException(404, f"Tuner-Run {run_id} nicht gefunden")
     return TunerRunOut(**run.to_json())
+
+
+# ─── Portfolio-Heat-Map (Vault/Bot/Portfolio-Heat-Map.md) ────────────────
+
+
+class PortfolioCell(BaseModel):
+    instrument: str
+    side: str | None        # "long" | "short" | None wenn flat
+    exposure_pct: float     # % von Equity
+    pnl_r: float            # Aktueller unrealized R-Multiple
+    setup_stage: str        # FSM-Status
+
+
+class PortfolioWarning(BaseModel):
+    type: str               # "correlation_cluster" | "high_total_heat"
+    detail: str
+
+
+class PortfolioHeatResponse(BaseModel):
+    cells: list[PortfolioCell]
+    total_heat_pct: float   # Sum of all |exposure| / total_equity
+    total_equity: float
+    warnings: list[PortfolioWarning]
+
+
+@app.get("/portfolio/heat", response_model=PortfolioHeatResponse)
+def portfolio_heat() -> PortfolioHeatResponse:
+    """Aggregiert offene Positionen über alle Bot-Instanzen.
+
+    Genutzt vom Live-Dashboard für die Heat-Map-Visualisierung + Korrelations-
+    Warnungen. Backend-side Risk-Logik (Cluster-Gate) ist bereits aktiv —
+    hier ist nur die Sichtbarkeits-Schicht.
+    """
+    orch = get_orchestrator()
+    cells: list[PortfolioCell] = []
+    total_equity = 0.0
+    total_exposure_abs = 0.0
+    sides_per_instrument: dict[str, str] = {}
+
+    for inst in orch.state.instances.values():
+        total_equity += inst.equity
+        if inst.open_trades:
+            trade = inst.open_trades[0]
+            # Exposure = aktives RISIKO (Distance-to-SL × Size) / Equity × 100.
+            # Bei CFDs/Hebel-Produkten ist Notional irrelevant — nur das tatsächliche
+            # Loss-bei-SL-Hit zählt. Bsp: SP500 short Notional $37k bei $10k Equity
+            # ist NICHT 360% Risk, sondern 0,77% Risk weil SL nah am Entry.
+            current_sl = trade.original_sl if trade.original_sl else trade.sl
+            current_size = trade.original_size if trade.original_size else trade.size
+            risk_at_sl = abs(trade.entry - current_sl) * current_size
+            exposure_pct = risk_at_sl / inst.equity * 100 if inst.equity > 0 else 0
+            # Unrealized R (grob aus partial_pnl + open-Approx — fair für UI)
+            risk_basis = abs(trade.entry - (trade.original_sl or trade.sl)) * (trade.original_size or trade.size)
+            pnl_r = (trade.partial_pnl / risk_basis) if risk_basis > 0 else 0
+            sides_per_instrument[inst.instrument] = trade.side
+            cells.append(PortfolioCell(
+                instrument=inst.instrument, side=trade.side,
+                exposure_pct=round(exposure_pct, 2),
+                pnl_r=round(pnl_r, 2),
+                setup_stage=inst.setup_stage,
+            ))
+            total_exposure_abs += abs(exposure_pct)
+        else:
+            cells.append(PortfolioCell(
+                instrument=inst.instrument, side=None,
+                exposure_pct=0.0, pnl_r=0.0,
+                setup_stage=inst.setup_stage,
+            ))
+
+    # Korrelations-Warnungen
+    warnings: list[PortfolioWarning] = []
+    indices_same_side = [
+        inst for inst, side in sides_per_instrument.items()
+        if inst in ("DE40", "NASDAQ", "SP500")
+    ]
+    if len(indices_same_side) >= 2:
+        # Sind sie alle in dieselbe Richtung?
+        sides = {sides_per_instrument[i] for i in indices_same_side}
+        if len(sides) == 1:
+            s = sides.pop()
+            warnings.append(PortfolioWarning(
+                type="correlation_cluster",
+                detail=f"{len(indices_same_side)} Indizes alle {s}: {','.join(indices_same_side)} — Cluster-Risk",
+            ))
+
+    if total_exposure_abs > 50:
+        warnings.append(PortfolioWarning(
+            type="high_total_heat",
+            detail=f"Gesamt-Exposure {total_exposure_abs:.1f}% > 50% Equity",
+        ))
+
+    return PortfolioHeatResponse(
+        cells=cells,
+        total_heat_pct=round(total_exposure_abs, 2),
+        total_equity=round(total_equity, 2),
+        warnings=warnings,
+    )
 
 
 @app.post("/tuner/run", response_model=TunerRunOut)

@@ -87,6 +87,10 @@ def find_choch_after(
     Vault (CHoCH.md): "erster Bruch-Signal auf dem Entry-TF nach dem HTF-Sweep"
     → früherer Entry, weniger Bestätigung als BOS.
 
+    Wir nutzen `find_pivots(df, 1, 1)` statt der inline-Mini-Pivot-Logik —
+    konsistent mit dem Rest der Strategie und korrekt bestätigt (n_right=1
+    heißt: Pivot wird 1 Bar später sichtbar, kein Lookahead).
+
     Wenn kein Swing nach dem Sweep geformt wurde → None (zu früh nach Sweep).
     """
     if from_bar_idx >= len(df) - 2:
@@ -94,52 +98,33 @@ def find_choch_after(
 
     opens = df["open"].to_numpy(dtype=float)
     closes = df["close"].to_numpy(dtype=float)
-    highs = df["high"].to_numpy(dtype=float)
-    lows = df["low"].to_numpy(dtype=float)
     times = list(df.index)
 
+    target_kind = "high" if direction == "long" else "low"
+    pivots_after = [
+        p for p in find_pivots(df, n_left=1, n_right=1)
+        if p.bar_idx > from_bar_idx and p.kind == target_kind
+    ]
+    if not pivots_after:
+        return None
+    target = pivots_after[0]   # erster Pivot nach Sweep
+
     if direction == "long":
-        # Suche das erste Pivot-High das NACH dem Sweep entstand (n=1 für Früherkennung)
-        choch_target: float | None = None
-        choch_bar: int = -1
-        for i in range(from_bar_idx + 1, len(df) - 1):
-            # Minimaler Pivot: höher als direkte Nachbarn
-            if highs[i] > highs[i - 1] and highs[i] > highs[i + 1] if i + 1 < len(df) else True:
-                choch_target = highs[i]
-                choch_bar = i
-                break
-        if choch_target is None:
-            return None
         body_high = np.maximum(opens, closes)
-        for i in range(choch_bar + 1, len(df)):
-            if body_high[i] > choch_target:
-                from .pivots import Swing as _Swing
-                _dummy = _Swing(time=times[choch_bar], price=choch_target,
-                                kind="high", bar_idx=choch_bar)
+        for i in range(target.bar_idx + 1, len(df)):
+            if body_high[i] > target.price:
                 return StructureBreak(
                     time=times[i], bar_idx=i,
                     body_extreme=float(body_high[i]),
-                    broken_swing=_dummy, direction="long",
+                    broken_swing=target, direction="long",
                 )
     else:
-        choch_target_low: float | None = None
-        choch_bar_low: int = -1
-        for i in range(from_bar_idx + 1, len(df) - 1):
-            if lows[i] < lows[i - 1] and lows[i] < lows[i + 1] if i + 1 < len(df) else True:
-                choch_target_low = lows[i]
-                choch_bar_low = i
-                break
-        if choch_target_low is None:
-            return None
         body_low = np.minimum(opens, closes)
-        for i in range(choch_bar_low + 1, len(df)):
-            if body_low[i] < choch_target_low:
-                from .pivots import Swing as _Swing
-                _dummy = _Swing(time=times[choch_bar_low], price=choch_target_low,
-                                kind="low", bar_idx=choch_bar_low)
+        for i in range(target.bar_idx + 1, len(df)):
+            if body_low[i] < target.price:
                 return StructureBreak(
                     time=times[i], bar_idx=i,
                     body_extreme=float(body_low[i]),
-                    broken_swing=_dummy, direction="short",
+                    broken_swing=target, direction="short",
                 )
     return None

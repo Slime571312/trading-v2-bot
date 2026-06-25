@@ -24,9 +24,15 @@ from .pivots import find_pivots
 def compute_bias(
     daily_df: pd.DataFrame,
     n_left: int = 3,
-    n_right: int = 3,
+    n_right: int = 2,
 ) -> Bias:
-    """Liefert Daily-Bias basierend auf dem jüngsten Daily-BoS."""
+    """Liefert Daily-Bias basierend auf dem jüngsten Daily-BoS.
+
+    n_right=2 (statt 3): der jüngste Daily-Pivot wird 2 Tage nach Bildung
+    sichtbar statt 3. Bias reagiert ~1 Tag schneller auf Trendwechsel — bei
+    Daily-TF ein relevanter Vorteil, kein Lookahead da Pivot weiterhin
+    n_right-Bars später bestätigt.
+    """
     pivots = find_pivots(daily_df, n_left, n_right)
     if not pivots:
         return Bias(direction="neutral")

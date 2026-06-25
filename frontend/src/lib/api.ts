@@ -198,15 +198,32 @@ export interface OpenTrade {
   htf_used: string;
   ltf_used: string;
   rr_at_open: number;
+  // Multi-TP-Staffelung (Bot/TP-Staffelung.md)
+  tp1?: number | null;
+  tp2?: number | null;
+  tp1_hit?: boolean;
+  tp2_hit?: boolean;
+  pct1?: number;
+  pct2?: number;
+  pct3?: number;
+  partial_pnl?: number;
 }
 
 export interface ClosedTrade extends OpenTrade {
   close_time: string;
   exit: number;
-  pnl_abs: number;
+  pnl_abs: number;       // Runner-Portion (Final-Close PnL)
   pnl_pct: number;
-  r_multiple: number;
+  r_multiple: number;    // gegen Original-Risk (Total)
   exit_reason: "sl" | "tp" | "manual" | "bot_stopped";
+  partial_pnl?: number;  // realisierter PnL aus TP1/TP2
+  total_pnl?: number;    // = pnl_abs + partial_pnl (Anzeige-Wert)
+}
+
+export function tradePnL(t: ClosedTrade): number {
+  // Anzeige-Wert: nimm total_pnl falls vorhanden, sonst Fallback auf pnl_abs.
+  // Legacy-Trades (vor Multi-TP-Fix) haben kein total_pnl gesetzt.
+  return t.total_pnl ?? t.pnl_abs;
 }
 
 export interface TickLogEntry {
@@ -228,6 +245,7 @@ export interface TickLogEntry {
 export interface BotInstance {
   instrument: string;
   running: boolean;
+  was_running?: boolean;
   started_at: string | null;
   stopped_at: string | null;
   last_tick: string | null;
@@ -242,6 +260,32 @@ export interface BotInstance {
   risk_pct: number;
   sweep_lookback: number;
   n_tick_log: number;
+  setup_stage?: string;
+}
+
+// Portfolio-Heat-Map (Vault/Bot/Portfolio-Heat-Map.md)
+export interface PortfolioCell {
+  instrument: string;
+  side: "long" | "short" | null;
+  exposure_pct: number;
+  pnl_r: number;
+  setup_stage: string;
+}
+export interface PortfolioWarning {
+  type: string;
+  detail: string;
+}
+export interface PortfolioHeat {
+  cells: PortfolioCell[];
+  total_heat_pct: number;
+  total_equity: number;
+  warnings: PortfolioWarning[];
+}
+
+export async function fetchPortfolioHeat(): Promise<PortfolioHeat> {
+  const r = await fetch(`${BASE}/portfolio/heat`);
+  if (!r.ok) throw new Error(`portfolio/heat ${r.status}`);
+  return r.json();
 }
 
 export interface BotOverview {

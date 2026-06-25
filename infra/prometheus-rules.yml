@@ -1,0 +1,247 @@
+# Prometheus Alert Rules für Trading-Bot v2
+# Docs: https://prometheus.io/docs/prometheus/latest/configuration/alerting_rules/
+
+groups:
+  - name: trading_bot_alerts
+    interval: 30s
+    evaluation_delay: 30s
+    rules:
+      # ──────────────────────────────────────────────────────────────────
+      # TIER 1: Application Alerts (Trading-spezifisch)
+      # ──────────────────────────────────────────────────────────────────
+
+      - alert: HighTickLatency
+        expr: histogram_quantile(0.95, rate(bot_tick_latency_ms_bucket[5m])) > 500
+        for: 2m
+        annotations:
+          summary: "High tick latency detected (p95 > 500ms)"
+          description: "Bot may be overwhelmed. Current p95: {{ $value | humanize }}ms. Check CPU/Memory."
+          severity: warning
+        labels:
+          severity: warning
+          component: application
+          action_required: investigate_cpu
+
+      - alert: SignalEvaluationSlow
+        expr: histogram_quantile(0.95, rate(bot_signal_latency_ms_bucket[5m])) > 250
+        for: 3m
+        annotations:
+          summary: "Signal evaluation time exceeds threshold (p95 > 250ms)"
+          description: "Current p95: {{ $value | humanize }}ms. Consider caching or optimizing evaluation logic."
+          severity: warning
+        labels:
+          severity: warning
+          component: application
+          action_required: optimize_signal_eval
+
+      - alert: HighTradeVelocity
+        expr: increase(bot_trades_opened_total[1h]) > 15
+        for: 1m
+        annotations:
+          summary: "More than 15 trades opened in 1h"
+          description: "Opened: {{ $value | humanize }} trades. May indicate whipsaws. Check entry logic."
+          severity: warning
+        labels:
+          severity: warning
+          component: application
+          action_required: check_entry_logic
+
+      - alert: LowWinRate
+        expr: bot_win_rate_7d < 0.40
+        for: 24h
+        annotations:
+          summary: "7-day win rate below 40%"
+          description: "Current: {{ $value | humanizePercentage }}. Strategy underperforming. Consider reoptimization."
+          severity: warning
+        labels:
+          severity: warning
+          component: application
+          action_required: reoptimize_strategy
+
+      - alert: HighDrawdown
+        expr: bot_drawdown_pct < -10
+        for: 5m
+        annotations:
+          summary: "Drawdown exceeds critical threshold (< -10%)"
+          description: "Current DD: {{ $value | humanize }}%. Equity curve under stress. Check positions immediately."
+          severity: critical
+        labels:
+          severity: critical
+          component: application
+          action_required: reduce_position_size
+
+      - alert: HighDailyLoss
+        expr: bot_daily_pnl_usd < -200
+        for: 30m
+        annotations:
+          summary: "Daily loss exceeds $200"
+          description: "Current Daily P/L: ${{ $value | humanize }}. Consider activating equity curve filter or reducing stake."
+          severity: warning
+        labels:
+          severity: warning
+          component: application
+          action_required: activate_ecf
+
+      - alert: ErrorRateHigh
+        expr: increase(bot_error_count_1h[5m]) > 5
+        for: 5m
+        annotations:
+          summary: "Error rate exceeds threshold (> 1 error/min)"
+          description: "Errors in last 5m: {{ $value | humanize }}. Check logs for error patterns."
+          severity: warning
+        labels:
+          severity: warning
+          component: application
+          action_required: check_logs
+
+      - alert: LoopNotTicking
+        expr: time() - bot_last_tick_timestamp_s > 30
+        for: 1m
+        annotations:
+          summary: "Bot loop hasn't ticked in 30+ seconds"
+          description: "Last tick age: {{ $value | humanize }}s. Loop may be stuck or crashed. Check logs immediately."
+          severity: critical
+        labels:
+          severity: critical
+          component: application
+          action_required: restart_backend
+
+      # ──────────────────────────────────────────────────────────────────
+      # TIER 2: System Alerts (Infrastructure)
+      # ──────────────────────────────────────────────────────────────────
+
+      - alert: HighCPU
+        expr: (100 - (avg by (instance) (irate(node_cpu_seconds_total{mode="idle"}[5m])) * 100)) > 75
+        for: 5m
+        annotations:
+          summary: "CPU usage exceeds 75%"
+          description: "Current CPU: {{ $value | humanize }}%. Check for background processes or optimize code."
+          severity: warning
+        labels:
+          severity: warning
+          component: system
+          action_required: check_cpu_load
+
+      - alert: HighMemory
+        expr: (1 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes)) * 100 > 80
+        for: 5m
+        annotations:
+          summary: "Memory usage exceeds 80%"
+          description: "Current Memory: {{ $value | humanize }}%. Low RAM available. Consider restart or optimization."
+          severity: warning
+        labels:
+          severity: warning
+          component: system
+          action_required: check_memory_leak
+
+      - alert: LowDiskSpace
+        expr: (1 - (node_filesystem_avail_bytes{mountpoint="/"} / node_filesystem_size_bytes{mountpoint="/"})) * 100 > 90
+        for: 10m
+        annotations:
+          summary: "Disk usage exceeds 90%"
+          description: "Current Disk: {{ $value | humanize }}%. Clean up logs or data immediately."
+          severity: critical
+        labels:
+          severity: critical
+          component: system
+          action_required: cleanup_disk
+
+      - alert: ProcessMemoryLeak
+        expr: increase(process_resident_memory_bytes[1h]) > (50 * 1024 * 1024)
+        for: 30m
+        annotations:
+          summary: "Process memory increasing > 50MB/hour (potential leak)"
+          description: "Memory growth: {{ $value | humanize }}B. Restart backend or investigate for leaks."
+          severity: warning
+        labels:
+          severity: warning
+          component: system
+          action_required: investigate_memory_leak
+
+      - alert: HighFileDescriptors
+        expr: process_open_fds > 200
+        for: 5m
+        annotations:
+          summary: "Process file descriptor count exceeds threshold"
+          description: "Current FDs: {{ $value | humanize }}. May indicate a resource leak. Restart backend."
+          severity: warning
+        labels:
+          severity: warning
+          component: system
+          action_required: restart_backend
+
+      - alert: ProcessCrashed
+        expr: up{job="trading-bot"} == 0
+        for: 1m
+        annotations:
+          summary: "Trading Bot process is down"
+          description: "Cannot reach http://localhost:8000/metrics. Backend may have crashed. Restart immediately."
+          severity: critical
+        labels:
+          severity: critical
+          component: system
+          action_required: restart_backend
+
+      # ──────────────────────────────────────────────────────────────────
+      # TIER 4: Health Checks (Boolean/State)
+      # ──────────────────────────────────────────────────────────────────
+
+      - alert: APIUnreachable
+        expr: up{job="trading-bot"} == 0
+        for: 1m
+        annotations:
+          summary: "Trading Bot API is unreachable"
+          description: "HTTP /metrics endpoint down. Backend is not responding."
+          severity: critical
+        labels:
+          severity: critical
+          component: health
+          action_required: restart_backend
+
+      - alert: DatabaseConnectionLost
+        expr: (time() - bot_last_db_query_timestamp_s) > 60
+        for: 2m
+        annotations:
+          summary: "No database queries in 60+ seconds"
+          description: "Last DB query age: {{ $value | humanize }}s. Database may be down or connection pool exhausted."
+          severity: critical
+        labels:
+          severity: critical
+          component: health
+          action_required: check_database
+
+      - alert: EquityDivergence
+        expr: abs(bot_equity_usd - bot_broker_equity_usd) > 10
+        for: 5m
+        annotations:
+          summary: "Equity divergence > $10"
+          description: "DB equity != broker equity. Divergence: ${{ $value | humanize }}. Check position reconciliation."
+          severity: critical
+        labels:
+          severity: critical
+          component: health
+          action_required: reconcile_positions
+
+      - alert: CircuitBreakerOpen
+        expr: bot_circuit_breaker_state == 2
+        for: 30s
+        annotations:
+          summary: "Broker circuit breaker is OPEN"
+          description: "API throttled due to rate limits. No new trades until recovered. Check broker status."
+          severity: critical
+        labels:
+          severity: critical
+          component: health
+          action_required: check_broker_status
+
+      - alert: PrometheusScrapeFailed
+        expr: up{job="trading-bot"} == 0
+        for: 2m
+        annotations:
+          summary: "Prometheus cannot scrape trading-bot metrics"
+          description: "Last successful scrape: {{ $value | humanize }}. Check backend connectivity."
+          severity: warning
+        labels:
+          severity: warning
+          component: health
+          action_required: check_backend_connectivity

@@ -21,6 +21,14 @@ backend/data/cache/*.parquet
 backend/reports/*.html
 backend/state/*.json
 !backend/state/live_state.json
+# State-Archive + Migrations-Backups (lokal-only, nicht ins Repo)
+backend/state/archive/
+backend/state/*.bak
+backend/state/*.broken-*
+
+# Logs
+*.log
+/tmp/trading-v2*.log
 
 # Secrets
 .env

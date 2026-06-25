@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.simonzernahle.trading-v2.bot</string>
+
+    <!-- bot-daemon.sh exec'ed uvicorn → launchd tracked direkt den Python-Prozess -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/simonzernahle/trading-v2/infra/launchd/bot-daemon.sh</string>
+    </array>
+
+    <!-- Starten bei Login (Mac-Boot inkl.) und nach launchctl bootstrap -->
+    <key>RunAtLoad</key>
+    <true/>
+
+    <!-- KeepAlive: respawn nach Crash. Mit SuccessfulExit=false läuft auch
+         nach launchctl bootout nicht weiter (= sauberer User-Stop möglich). -->
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <!-- Min 10s zwischen Restarts — verhindert Spam-Respawn bei Konfig-Fehler -->
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/trading-v2-bot.launchd.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/trading-v2-bot.launchd.err</string>
+
+    <!-- Working-Dir explizit setzen, sonst nutzt launchd $HOME -->
+    <key>WorkingDirectory</key>
+    <string>/Users/simonzernahle/trading-v2</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+        <key>HOME</key>
+        <string>/Users/simonzernahle</string>
+        <key>HOST</key>
+        <string>127.0.0.1</string>
+        <key>PORT</key>
+        <string>8000</string>
+        <key>LOG_LEVEL</key>
+        <string>info</string>
+    </dict>
+</dict>
+</plist>

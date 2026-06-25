@@ -6,8 +6,10 @@ import {
   fetchBotOverview, startBot, stopBot, resetBot,
   startAllBots, stopAllBots, fetchTickLog,
   fetchBotStats, patchBotConfig, fetchCandles,
+  fetchPortfolioHeat, tradePnL,
   type BotInstance, type BotOverview, type Instrument, type TickLogEntry,
   type BotStats, type BotConfigPatch, type Candle, type Timeframe,
+  type PortfolioHeat,
 } from "@/lib/api";
 import { useLiveFeed } from "@/lib/useLiveFeed";
 
@@ -216,11 +218,38 @@ function BotDetailModal({ instrument, instance, onClose, onRefresh }: {
   const markers: TradeMarker[] = [];
 
   if (openTrade) {
+    // Basis-Linien: Entry + aktueller SL + finales TP (=TP3 wenn Runner)
     priceLines.push(
       { price: openTrade.entry, color: "#3b82f6", label: `Entry ${openTrade.entry.toFixed(2)}` },
       { price: openTrade.sl, color: "#ef4444", label: `SL ${openTrade.sl.toFixed(2)}`, dashed: true },
-      { price: openTrade.tp, color: "#22c55e", label: `TP ${openTrade.tp.toFixed(2)}`, dashed: true },
     );
+    // Multi-TP-Linien — gestrichelt grün, durchgestrichene Label wenn schon gehit
+    const pct1 = (openTrade.pct1 ?? 0.5) * 100;
+    const pct2 = (openTrade.pct2 ?? 0.5) * 100;
+    const pct3 = (openTrade.pct3 ?? 0) * 100;
+    if (openTrade.tp1 != null) {
+      priceLines.push({
+        price: openTrade.tp1,
+        color: openTrade.tp1_hit ? "#94a3b8" : "#22c55e",
+        label: `${openTrade.tp1_hit ? "✓ " : ""}TP1 ${openTrade.tp1.toFixed(2)} (${pct1.toFixed(0)}%)`,
+        dashed: true,
+      });
+    }
+    if (openTrade.tp2 != null) {
+      priceLines.push({
+        price: openTrade.tp2,
+        color: openTrade.tp2_hit ? "#94a3b8" : "#22c55e",
+        label: `${openTrade.tp2_hit ? "✓ " : ""}TP2 ${openTrade.tp2.toFixed(2)} (${pct2.toFixed(0)}%)`,
+        dashed: true,
+      });
+    }
+    // Finales TP (=TP3 wenn Runner aktiv, sonst nur TP)
+    const tp3Label = pct3 > 0
+      ? `TP3 ${openTrade.tp.toFixed(2)} (${pct3.toFixed(0)}%)`
+      : `TP ${openTrade.tp.toFixed(2)}`;
+    priceLines.push({
+      price: openTrade.tp, color: "#22c55e", label: tp3Label, dashed: true,
+    });
     markers.push({
       time: openTrade.open_time, side: openTrade.side as "long" | "short",
       kind: "open", price: openTrade.entry,
@@ -654,6 +683,28 @@ function BotCard({ inst, onChange, onShowTicks, onShowDetails }: {
   const wr = inst.closed_trades.length > 0 ? (wins / inst.closed_trades.length) * 100 : null;
   const isRunning = inst.running;
 
+  // Equity-Curve aus closed_trades — cumulative PnL über Initial-Capital
+  const equityCurve: number[] = (() => {
+    const sorted = [...inst.closed_trades].sort(
+      (a, b) => new Date(a.close_time).getTime() - new Date(b.close_time).getTime(),
+    );
+    const curve: number[] = [inst.initial_capital];
+    let eq = inst.initial_capital;
+    for (const t of sorted) {
+      eq += tradePnL(t);
+      curve.push(eq);
+    }
+    return curve;
+  })();
+  // Drawdown vom All-Time-High (für DD-Widget)
+  const equityHigh = Math.max(...equityCurve, inst.equity);
+  const ddPct = equityHigh > 0 ? ((equityHigh - inst.equity) / equityHigh) * 100 : 0;
+  const ddTier = ddPct < 3 ? "healthy" : ddPct < 5 ? "light" : ddPct < 8 ? "medium" : "severe";
+  const ddColor =
+    ddTier === "healthy" ? "var(--text-dim)" :
+    ddTier === "light" ? "#eab308" :
+    ddTier === "medium" ? "#f59e0b" : "var(--red)";
+
   return (
     <div
       onClick={(e) => {
@@ -715,24 +766,82 @@ function BotCard({ inst, onChange, onShowTicks, onShowDetails }: {
       </div>
 
       {/* Open Trade */}
-      {inst.open_trades.length > 0 && (
-        <div style={{
-          background: "var(--bg)", border: "1px solid var(--border)",
-          borderRadius: 6, padding: "6px 10px", marginBottom: 10, fontSize: 11,
-        }}>
+      {inst.open_trades.length > 0 && (() => {
+        const t = inst.open_trades[0];
+        const hasMultiTp = t.tp1 != null && t.tp2 != null;
+        const pct1 = (t.pct1 ?? 0.5) * 100;
+        const pct2 = (t.pct2 ?? 0.5) * 100;
+        const pct3 = (t.pct3 ?? 0) * 100;
+        return (
           <div style={{
-            color: inst.open_trades[0].side === "long" ? "var(--green)" : "var(--red)",
-            fontWeight: 700, marginBottom: 2,
+            background: "var(--bg)", border: "1px solid var(--border)",
+            borderRadius: 6, padding: "6px 10px", marginBottom: 10, fontSize: 11,
           }}>
-            OFFEN: {inst.open_trades[0].side.toUpperCase()} @ {inst.open_trades[0].entry.toFixed(2)}
+            <div style={{
+              color: t.side === "long" ? "var(--green)" : "var(--red)",
+              fontWeight: 700, marginBottom: 2,
+            }}>
+              OFFEN: {t.side.toUpperCase()} @ {t.entry.toFixed(2)}
+              {t.partial_pnl && t.partial_pnl !== 0 ? (
+                <span style={{ marginLeft: 8, fontSize: 10, color: "var(--accent)" }}>
+                  realisiert {t.partial_pnl >= 0 ? "+" : ""}{t.partial_pnl.toFixed(2)}
+                </span>
+              ) : null}
+            </div>
+            <div style={{ color: "var(--text-dim)" }}>
+              SL <span style={{ color: "var(--red)" }}>{t.sl.toFixed(2)}</span>
+              {hasMultiTp ? (
+                <>
+                  {" · "}TP1{" "}
+                  <span style={{
+                    color: t.tp1_hit ? "var(--text-dim)" : "var(--green)",
+                    textDecoration: t.tp1_hit ? "line-through" : "none",
+                  }}>
+                    {t.tp1!.toFixed(2)} ({pct1.toFixed(0)}%)
+                  </span>
+                  {" · "}TP2{" "}
+                  <span style={{
+                    color: t.tp2_hit ? "var(--text-dim)" : "var(--green)",
+                    textDecoration: t.tp2_hit ? "line-through" : "none",
+                  }}>
+                    {t.tp2!.toFixed(2)} ({pct2.toFixed(0)}%)
+                  </span>
+                  {pct3 > 0 && (
+                    <>
+                      {" · "}TP3{" "}
+                      <span style={{ color: "var(--green)" }}>
+                        {t.tp.toFixed(2)} ({pct3.toFixed(0)}%)
+                      </span>
+                    </>
+                  )}
+                </>
+              ) : (
+                <>
+                  {" · "}TP <span style={{ color: "var(--green)" }}>{t.tp.toFixed(2)}</span>
+                </>
+              )}
+              {" · "}RR <span style={{ color: "var(--accent)" }}>{t.rr_at_open.toFixed(2)}</span>
+            </div>
           </div>
-          <div style={{ color: "var(--text-dim)" }}>
-            SL <span style={{ color: "var(--red)" }}>{inst.open_trades[0].sl.toFixed(2)}</span>
-            {" · "}TP <span style={{ color: "var(--green)" }}>{inst.open_trades[0].tp.toFixed(2)}</span>
-            {" · "}RR <span style={{ color: "var(--accent)" }}>{inst.open_trades[0].rr_at_open.toFixed(2)}</span>
+        );
+      })()}
+
+      {/* Equity-Sparkline + DD-Widget */}
+      <div style={{
+        display: "flex", alignItems: "center", gap: 10,
+        marginBottom: 8, padding: "4px 0",
+      }}>
+        <EquitySparkline data={equityCurve} width={180} height={32} />
+        <div style={{ fontSize: 10, lineHeight: 1.3 }}>
+          <div style={{ color: "var(--text-dim)" }}>DD</div>
+          <div style={{ color: ddColor, fontWeight: 700 }}>
+            {ddPct.toFixed(1)}%
           </div>
+          {ddTier !== "healthy" && (
+            <div style={{ color: ddColor, fontSize: 9 }}>{ddTier}</div>
+          )}
         </div>
-      )}
+      </div>
 
       {/* Stats */}
       <div style={{ display: "flex", gap: 12, fontSize: 11, color: "var(--text-dim)", marginBottom: 10 }}>
@@ -740,6 +849,11 @@ function BotCard({ inst, onChange, onShowTicks, onShowDetails }: {
         {wr !== null && <span>WR: <b style={{ color: "var(--text)" }}>{wr.toFixed(0)}%</b></span>}
         <span>RR≥<b style={{ color: "var(--text)" }}>{inst.rr_threshold}</b></span>
         <span>Risk <b style={{ color: "var(--text)" }}>{(inst.risk_pct * 100).toFixed(1)}%</b></span>
+        {inst.setup_stage && inst.setup_stage !== "idle" && (
+          <span title="Setup-FSM-Stage">
+            FSM: <b style={{ color: "var(--accent)" }}>{inst.setup_stage}</b>
+          </span>
+        )}
       </div>
 
       {/* Action Row */}
@@ -800,8 +914,10 @@ function AllClosedTrades({ instances }: { instances: BotInstance[] }) {
         </tr>
       </thead>
       <tbody>
-        {sorted.slice(0, 30).map((t) => (
-          <tr key={t.id} style={{ borderBottom: "1px solid var(--border)" }}>
+        {sorted.slice(0, 30).map((t, i) => (
+          // Composite-Key: instrument + id + close_time + index. Falls Backend-State
+          // mal Duplikate enthält (passierte historisch), crasht React nicht mehr.
+          <tr key={`${t.instrument}-${t.id}-${t.close_time}-${i}`} style={{ borderBottom: "1px solid var(--border)" }}>
             <td style={{ padding: "5px 8px", fontWeight: 600 }}>{t.instrument}</td>
             <td style={{ padding: "5px 8px", color: t.side === "long" ? "var(--green)" : "var(--red)", fontWeight: 600 }}>{t.side}</td>
             <td style={{ padding: "5px 8px" }}>{t.entry.toFixed(2)}</td>
@@ -809,8 +925,13 @@ function AllClosedTrades({ instances }: { instances: BotInstance[] }) {
             <td style={{ padding: "5px 8px", color: t.r_multiple > 0 ? "var(--green)" : "var(--red)", fontWeight: 700 }}>
               {t.r_multiple >= 0 ? "+" : ""}{t.r_multiple.toFixed(2)}R
             </td>
-            <td style={{ padding: "5px 8px", color: t.pnl_abs >= 0 ? "var(--green)" : "var(--red)" }}>
-              {t.pnl_abs >= 0 ? "+" : ""}{t.pnl_abs.toFixed(2)}
+            <td style={{ padding: "5px 8px", color: tradePnL(t) >= 0 ? "var(--green)" : "var(--red)" }}>
+              {tradePnL(t) >= 0 ? "+" : ""}{tradePnL(t).toFixed(2)}
+              {t.partial_pnl && t.partial_pnl !== 0 ? (
+                <span style={{ fontSize: 10, color: "var(--text-dim)", marginLeft: 4 }}>
+                  (TP1/2: {t.partial_pnl > 0 ? "+" : ""}{t.partial_pnl.toFixed(2)})
+                </span>
+              ) : null}
             </td>
             <td style={{ padding: "5px 8px", color: "var(--text-dim)" }}>{t.exit_reason}</td>
             <td style={{ padding: "5px 8px", color: "var(--text-dim)" }}>{t.close_time.slice(0, 16).replace("T", " ")}</td>
@@ -823,23 +944,102 @@ function AllClosedTrades({ instances }: { instances: BotInstance[] }) {
 
 // ─── Main Page ──────────────────────────────────────────────────────────
 
-const GITHUB_STATE_URL =
-  "https://raw.githubusercontent.com/Slime571312/trading-v2-bot/main/backend/state/live_state.json";
+// GitHub-State-Fallback entfernt (Juni 2026): wenn das lokale Backend kurz
+// nicht antwortet (uvicorn-Reload, WiFi-Hickup, Mac-Wakeup) zeigte der Fallback
+// einen veralteten GH-Actions-Cron-State mit running=false — und der User dachte
+// die Bots wären gestoppt obwohl sie laufen. Stattdessen halten wir den letzten
+// bekannten lokalen Zustand und zeigen einen "Verbindung weg"-Banner.
 
-async function fetchGithubState(): Promise<BotOverview | null> {
-  try {
-    const r = await fetch(GITHUB_STATE_URL + "?t=" + Date.now());
-    if (!r.ok) return null;
-    const data = await r.json();
-    const instances: BotInstance[] = Object.values(data.instances ?? {}) as BotInstance[];
-    return {
-      instances,
-      total_equity: instances.reduce((s: number, i: BotInstance) => s + i.equity, 0),
-      any_running: instances.some((i: BotInstance) => i.running),
-      n_ws_clients: 0,
-    };
-  } catch { return null; }
+// ─── Equity-Sparkline (Vault/Bot/Equity-Curve-Filter.md) ─────────────
+// Inline-SVG-Sparkline ohne Recharts-Dep — minimal, schnell, kein neuer
+// Build-Overhead. Zeigt die letzten N Equity-Punkte als Linie.
+
+function EquitySparkline({
+  data, width = 220, height = 36, color = "var(--accent)",
+}: { data: number[]; width?: number; height?: number; color?: string }) {
+  if (data.length < 2) {
+    return <div style={{ width, height, color: "var(--text-dim)", fontSize: 10, padding: 4 }}>
+      Noch keine Trades.
+    </div>;
+  }
+  const min = Math.min(...data);
+  const max = Math.max(...data);
+  const range = max - min || 1;
+  // Padding oben/unten
+  const padY = 4;
+  const usableH = height - 2 * padY;
+  const stepX = width / (data.length - 1);
+  const points = data.map((v, i) => {
+    const x = i * stepX;
+    const y = padY + usableH - ((v - min) / range) * usableH;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  // Fill-Area unter der Linie (subtil)
+  const last = data[data.length - 1];
+  const first = data[0];
+  const trendUp = last >= first;
+  const lineColor = trendUp ? "#22c55e" : "#ef4444";
+  return (
+    <svg width={width} height={height} style={{ display: "block" }}>
+      <polyline
+        points={points}
+        fill="none"
+        stroke={lineColor}
+        strokeWidth={1.5}
+        strokeLinejoin="round"
+      />
+    </svg>
+  );
 }
+
+
+// ─── Portfolio-Heat-Map (Vault/Bot/Portfolio-Heat-Map.md) ────────────
+
+function PortfolioHeatBar({ heat }: { heat: PortfolioHeat | null }) {
+  if (!heat) return null;
+  const pct = Math.min(100, heat.total_heat_pct);
+  const color = pct > 50 ? "var(--red)" : pct > 25 ? "#f59e0b" : "var(--green)";
+  return (
+    <div style={{
+      display: "flex", alignItems: "center", gap: 8,
+      padding: "6px 12px", borderRadius: 6,
+      background: "var(--bg)", border: "1px solid var(--border)",
+      fontSize: 11,
+    }}>
+      <span style={{ color: "var(--text-dim)" }}>Heat</span>
+      <div style={{
+        width: 80, height: 8, background: "rgba(148,163,184,0.2)",
+        borderRadius: 4, overflow: "hidden",
+      }}>
+        <div style={{ width: `${pct}%`, height: "100%", background: color }} />
+      </div>
+      <span style={{ color, fontWeight: 700 }}>{pct.toFixed(0)}%</span>
+      <span style={{ color: "var(--text-dim)" }}>·</span>
+      {heat.cells.map((c) => {
+        const side = c.side;
+        if (!side) return null;
+        const bg = side === "long" ? "rgba(34,197,94,0.18)" : "rgba(239,68,68,0.18)";
+        const fg = side === "long" ? "var(--green)" : "var(--red)";
+        return (
+          <span key={c.instrument} style={{
+            background: bg, color: fg, padding: "2px 6px",
+            borderRadius: 4, fontWeight: 600,
+          }}>
+            {c.instrument} {side === "long" ? "↑" : "↓"} {c.exposure_pct.toFixed(0)}%
+          </span>
+        );
+      })}
+      {heat.warnings.length > 0 && (
+        <span title={heat.warnings.map(w => w.detail).join("\n")} style={{
+          marginLeft: 4, color: "#f59e0b", cursor: "help",
+        }}>
+          ⚠ {heat.warnings.length}
+        </span>
+      )}
+    </div>
+  );
+}
+
 
 export default function LivePage() {
   const { instances: liveInstances, status: wsStatus } = useLiveFeed();
@@ -849,16 +1049,25 @@ export default function LivePage() {
   const [err, setErr] = useState<string | null>(null);
   const [tickModalFor, setTickModalFor] = useState<Instrument | null>(null);
   const [detailModalFor, setDetailModalFor] = useState<Instrument | null>(null);
+  const [portfolioHeat, setPortfolioHeat] = useState<PortfolioHeat | null>(null);
 
   async function reload() {
+    // Nur LOKALES Backend pollen. Bei Fehler: backendOnline=false, aber
+    // letzten bekannten Stand (`fallback`) NICHT überschreiben — sonst springt
+    // die UI von "läuft" auf "leer" bei jedem 100ms-Hicup.
     try {
       const o = await fetchBotOverview();
       setFallback(o);
       setBackendOnline(true);
     } catch {
       setBackendOnline(false);
-      const gh = await fetchGithubState();
-      if (gh) setFallback(gh);
+    }
+    // Heat-Map separat — fail-silent damit ein heat-Fehler nicht die Main-UI hängt
+    try {
+      const h = await fetchPortfolioHeat();
+      setPortfolioHeat(h);
+    } catch {
+      /* ignore */
     }
   }
 
@@ -936,7 +1145,14 @@ export default function LivePage() {
           }}>
             {runningCount > 0 ? `● ${runningCount}/${instances.length} RUN` : "○ ALL STOPPED"}
           </span>
-          <span style={{ fontSize: 10, color: "var(--text-dim)" }}>WS: {wsStatus}</span>
+          <span style={{
+            fontSize: 10, padding: "2px 8px", borderRadius: 10, fontWeight: 600,
+            background: wsStatus === "open" ? "rgba(34,197,94,0.15)" : "rgba(251,191,36,0.15)",
+            color: wsStatus === "open" ? "var(--green)" : "#f59e0b",
+          }}>
+            {wsStatus === "open" ? "● LIVE" : wsStatus === "connecting" ? "↻ connecting" : "⚠ live-feed weg"}
+          </span>
+          <PortfolioHeatBar heat={portfolioHeat} />
         </div>
         <div style={{ display: "flex", gap: 6 }}>
           <button onClick={handleSync} disabled={busy}
@@ -956,7 +1172,7 @@ export default function LivePage() {
 
       {!backendOnline && (
         <div style={{ background: "rgba(251,191,36,0.1)", border: "1px solid #f59e0b", color: "#f59e0b", padding: "8px 12px", borderRadius: 6, fontSize: 12, marginBottom: 12, display: "flex", alignItems: "center", gap: 8 }}>
-          <span>⚡ GitHub-Modus — Backend offline, zeige letzten Stand von GitHub (alle 15s aktualisiert)</span>
+          <span>⚠ Backend nicht erreichbar — zeige letzten bekannten Stand. Bots laufen ggf. weiter, nur die UI-Updates fehlen.</span>
         </div>
       )}
       {err && (

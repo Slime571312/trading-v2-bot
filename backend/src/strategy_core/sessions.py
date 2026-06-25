@@ -27,6 +27,12 @@ CRYPTO_INSTRUMENTS = {"BTC"}
 LONDON_OPEN = (dtime(9, 0), dtime(12, 0))
 NY_OPEN = (dtime(15, 30), dtime(18, 0))
 
+# BTC ist zwar 24/7, aber Liquidität konzentriert sich auf London + NY Hours.
+# Outside-Hours: dünne Order-Books → Sweep-/BOS-Detection unzuverlässig
+# (Wicks von 0.5% in 5min ohne Volume). Wir handeln BTC nur zwischen
+# 07-22 UTC (London-PreMarket bis NY-Close).
+CRYPTO_HOURS_UTC = (7, 22)
+
 # Silver-Bullet Fenster (ET, DST-sicher via ZoneInfo)
 SILVER_BULLET_WINDOWS: dict[str, tuple[dtime, dtime]] = {
     "london_open": (dtime(3, 0),  dtime(4, 0)),    # 08:00–09:00 UTC
@@ -47,6 +53,70 @@ WEEKEND_END_DOW = 6     # Sunday
 WEEKEND_END_HOUR_UTC = 22
 
 
+# Holiday-Calendar — kein Entry an offiziellen Schließtagen der Index-Heimat-Börse.
+# Quelle: NYSE-Holiday-Schedule (US-Indizes) + Deutsche Börse/Eurex (DE40).
+# Crypto (BTC) trade 24/7 inkl. Feiertage — daher nur Indizes gateen.
+# Format: set of ISO-date-strings, in `_is_holiday` als date-Objekt verglichen.
+NYSE_HOLIDAYS = {
+    # 2026
+    date(2026, 1, 1),   # New Year's Day
+    date(2026, 1, 19),  # MLK Day
+    date(2026, 2, 16),  # Presidents Day
+    date(2026, 4, 3),   # Good Friday
+    date(2026, 5, 25),  # Memorial Day
+    date(2026, 6, 19),  # Juneteenth
+    date(2026, 7, 3),   # Independence Day observed (4th is Sat)
+    date(2026, 9, 7),   # Labor Day
+    date(2026, 11, 26), # Thanksgiving
+    date(2026, 12, 25), # Christmas
+    # 2027
+    date(2027, 1, 1),
+    date(2027, 1, 18),  # MLK Day
+    date(2027, 2, 15),  # Presidents Day
+    date(2027, 3, 26),  # Good Friday
+    date(2027, 5, 31),  # Memorial Day
+    date(2027, 7, 5),   # Independence Day observed (4th is Sun)
+    date(2027, 9, 6),   # Labor Day
+    date(2027, 11, 25), # Thanksgiving
+    date(2027, 12, 24), # Christmas Eve observed (25th is Sat)
+}
+
+EUREX_HOLIDAYS = {
+    # 2026
+    date(2026, 1, 1),   # New Year
+    date(2026, 4, 3),   # Good Friday
+    date(2026, 4, 6),   # Easter Monday
+    date(2026, 5, 1),   # Tag der Arbeit
+    date(2026, 12, 24), # Heiligabend (halbtags — conservative: voll skip)
+    date(2026, 12, 25), # 1. Weihnachtstag
+    date(2026, 12, 26), # 2. Weihnachtstag (Samstag 2026)
+    date(2026, 12, 31), # Silvester
+    # 2027
+    date(2027, 1, 1),
+    date(2027, 3, 26),  # Good Friday
+    date(2027, 3, 29),  # Easter Monday
+    date(2027, 12, 24),
+    date(2027, 12, 27), # 2. Weihnachtstag observed (26 is Sun)
+    date(2027, 12, 31),
+}
+
+INSTRUMENT_HOLIDAYS: dict[str, set] = {
+    "NASDAQ": NYSE_HOLIDAYS,
+    "SP500":  NYSE_HOLIDAYS,
+    "DE40":   EUREX_HOLIDAYS,
+}
+
+
+def is_market_holiday(ts: pd.Timestamp, instrument: str) -> bool:
+    """True wenn der Trading-Tag ein offizieller Holiday für die Heimat-Börse ist."""
+    cal = INSTRUMENT_HOLIDAYS.get(instrument)
+    if cal is None:
+        return False
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    return ts.tz_convert("UTC").date() in cal
+
+
 def _is_index_market_closed(ts_utc: pd.Timestamp) -> bool:
     """True wenn Indizes-Markt geschlossen ist (Fr 22:00 UTC → So 22:00 UTC)."""
     dow = ts_utc.dayofweek
@@ -62,13 +132,19 @@ def _is_index_market_closed(ts_utc: pd.Timestamp) -> bool:
 
 def is_in_session(ts: pd.Timestamp, instrument: str) -> bool:
     """True wenn der Zeitpunkt in einem erlaubten Trading-Fenster für das Instrument liegt."""
-    if instrument in CRYPTO_INSTRUMENTS:
-        return True   # BTC: immer offen
-
-    # Capital-Timestamps kommen UTC
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
     ts_utc = ts.tz_convert("UTC")
+
+    if instrument in CRYPTO_INSTRUMENTS:
+        # BTC nur in den High-Volume-Hours (London + NY) — außerhalb sind die
+        # Order-Books zu dünn für reliable Sweep/BOS-Detection.
+        start_h, end_h = CRYPTO_HOURS_UTC
+        return start_h <= ts_utc.hour < end_h
+
+    # Indizes: Holiday-Check zusätzlich zum Weekend-Gate
+    if is_market_holiday(ts_utc, instrument):
+        return False
 
     # Wochenende → Indizes geschlossen
     if _is_index_market_closed(ts_utc):
@@ -82,13 +158,17 @@ def is_in_session(ts: pd.Timestamp, instrument: str) -> bool:
 
 
 def session_label(ts: pd.Timestamp, instrument: str) -> str:
-    """Lesbares Label fürs Dashboard — 'london' | 'ny' | 'crypto-24h' | 'weekend' | 'closed'."""
-    if instrument in CRYPTO_INSTRUMENTS:
-        return "crypto-24h"
+    """Lesbares Label fürs Dashboard — 'london' | 'ny' | 'crypto-hours' | 'crypto-offhours' | 'weekend' | 'closed'."""
     if ts.tzinfo is None:
         ts = ts.tz_localize("UTC")
+    if instrument in CRYPTO_INSTRUMENTS:
+        h = ts.tz_convert("UTC").hour
+        start_h, end_h = CRYPTO_HOURS_UTC
+        return "crypto-hours" if start_h <= h < end_h else "crypto-offhours"
     if _is_index_market_closed(ts.tz_convert("UTC")):
         return "weekend"
+    if is_market_holiday(ts.tz_convert("UTC"), instrument):
+        return "holiday"
     berlin = ts.tz_convert(BERLIN)
     t = berlin.time()
     if LONDON_OPEN[0] <= t < LONDON_OPEN[1]:

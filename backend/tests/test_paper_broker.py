@@ -42,8 +42,9 @@ def _bar(o: float, h: float, l: float, c: float) -> pd.Series:
 
 
 def test_open_long_position_sizing():
-    """Bei 1% Risk + SL-Distanz 100 sollte size = (10000*0.01)/100 = 1.0."""
-    signal = _make_signal("long", entry=50_000, sl=49_900, tp=50_300)
+    """Bei 1% Risk + SL-Distanz 500 (=1% von 50k, über BTC min_sl_pct=0.5%)
+    sollte size = (10000*0.01)/500 = 0.2."""
+    signal = _make_signal("long", entry=50_000, sl=49_500, tp=51_500)
     bar = _bar(50_000, 50_010, 49_990, 50_000)
     trade = paper_broker.open_position(signal, equity=10_000, risk_pct=0.01, current_bar=bar)
     assert trade is not None
@@ -53,11 +54,19 @@ def test_open_long_position_sizing():
 
 
 def test_open_short_position():
-    signal = _make_signal("short", entry=50_000, sl=50_100, tp=49_700)
+    signal = _make_signal("short", entry=50_000, sl=50_500, tp=48_500)
     bar = _bar(50_000, 50_010, 49_990, 50_000)
     trade = paper_broker.open_position(signal, equity=10_000, risk_pct=0.01, current_bar=bar)
     assert trade is not None
     assert trade.side == "short"
+
+
+def test_open_position_rejected_when_sl_too_tight_for_btc():
+    """BTC min_sl_pct=0.5% (vs. 0.08% für Indizes) — enger SL = skip."""
+    signal = _make_signal("long", entry=50_000, sl=49_900, tp=50_300)  # 0.2% SL
+    bar = _bar(50_000, 50_010, 49_990, 50_000)
+    trade = paper_broker.open_position(signal, equity=10_000, risk_pct=0.01, current_bar=bar)
+    assert trade is None  # gefiltert wegen min_sl_pct=0.5% für BTC
 
 
 def test_open_position_rejects_zero_sl():

@@ -19,7 +19,7 @@ class BacktestTrade:
     entry: float            # nach Slippage
     exit: float             # nach Slippage
     sl: float               # Stop-Loss-Level (ohne Slippage; intrabar getriggert)
-    tp: float               # Take-Profit-Level
+    tp: float               # Take-Profit-Level (=TP3 wenn Runner)
     size: float             # Units (risk_per_trade / sl_distance)
     variant: SignalVariant
     htf_used: str
@@ -29,6 +29,19 @@ class BacktestTrade:
     pnl_pct: float          # PnL als Prozent des Notional (entry * size)
     r_multiple: float       # PnL in Vielfachen des Risikos (1.0 = +1R, -1.0 = SL hit)
     exit_reason: ExitReason
+    # Multi-TP-Staffelung — identisches Schema wie OpenTrade in der Live-Welt.
+    # Wenn None → 1-Tier-Exit (Legacy). Wenn gesetzt → 3-Tier-Backtest mit
+    # partial_pnl-Akkumulation, konsistent zu Live.
+    tp1: float | None = None
+    tp2: float | None = None
+    pct1: float = 0.5
+    pct2: float = 0.5
+    pct3: float = 0.0
+    tp1_hit: bool = False
+    tp2_hit: bool = False
+    original_size: float = 0.0   # = size beim Open, für partial-close-Sizing
+    original_sl: float = 0.0     # initialer SL für R-Multiple-Berechnung
+    partial_pnl: float = 0.0
 
 
 @dataclass(slots=True)

@@ -40,6 +40,12 @@ class BotConfig(BaseSettings):
     port: int = Field(default=8000)
     log_level: Literal["debug", "info", "warning", "error"] = Field(default="info")
 
+    # ─── Telegram-Alerts (optional — Vault/Bot/Observability.md) ────────
+    # Wenn nicht konfiguriert: Alerts sind no-op. Kein Crash, kein Spam.
+    # Setup: `https://core.telegram.org/bots#how-do-i-create-a-bot` → token + chat_id
+    telegram_bot_token: str = Field(default="", description="@BotFather Token")
+    telegram_chat_id: str = Field(default="", description="Chat-ID (Personal oder Gruppe)")
+
     # ─── Strategie — Playbook-Parameter ──────────────────────────────────
     # Default-Werte nach ~/Desktop/tradingbot/Trading/Bot/Playbook.md
     instruments: list[str] = Field(
@@ -101,6 +107,7 @@ EPIC_MAP: dict[str, str] = {
     "NASDAQ": "US100",
     "SP500": "US500",
     "BTC": "BTCUSD",
+    "ETH": "ETHUSD",   # SMT-Reference für BTC (Crypto-Twin)
 }
 
 # ─── TF-Mapping: Playbook-String → Capital-Resolution ────────────────────

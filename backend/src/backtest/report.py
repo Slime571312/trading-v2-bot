@@ -20,6 +20,9 @@ REPORT_DIR.mkdir(parents=True, exist_ok=True)
 
 def _summary_html(r: BacktestResult) -> str:
     m = r.metrics
+    # Bei 0 Trades sind profit_factor und sharpe None — fmt-string würde sonst crashen.
+    pf_str = f"{m.profit_factor:.2f}" if m.profit_factor is not None else "—"
+    sh_str = f"{m.sharpe:.2f}" if m.sharpe is not None else "—"
     return f"""
     <div style="font-family: -apple-system, sans-serif; padding: 16px 24px;
                 background: #f5f5f7; border-radius: 8px; margin-bottom: 24px;">
@@ -35,10 +38,10 @@ def _summary_html(r: BacktestResult) -> str:
           <td style="padding: 4px 16px 4px 0;"><b>Avg Win R:</b> {m.avg_win_r:+.2f}</td>
           <td style="padding: 4px 16px 4px 0;"><b>Avg Loss R:</b> {m.avg_loss_r:+.2f}</td>
           <td style="padding: 4px 16px 4px 0;"><b>Expectancy:</b> {m.expectancy_r:+.2f}R</td>
-          <td style="padding: 4px 16px 4px 0;"><b>Profit Factor:</b> {m.profit_factor:.2f}</td>
+          <td style="padding: 4px 16px 4px 0;"><b>Profit Factor:</b> {pf_str}</td>
         </tr>
         <tr>
-          <td style="padding: 4px 16px 4px 0;"><b>Sharpe:</b> {m.sharpe:.2f}</td>
+          <td style="padding: 4px 16px 4px 0;"><b>Sharpe:</b> {sh_str}</td>
           <td style="padding: 4px 16px 4px 0;"><b>Exposure:</b> {m.exposure_pct:.1f}%</td>
           <td style="padding: 4px 16px 4px 0;"><b>Initial:</b> €{r.initial_capital:,.0f}</td>
           <td style="padding: 4px 16px 4px 0;"><b>Final:</b> €{r.final_equity:,.2f}</td>

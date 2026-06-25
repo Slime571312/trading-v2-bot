@@ -9,6 +9,9 @@ Public Endpoint, kein API-Key nötig:
 
 Cache: 30min (Funding updated alle 8h, also reichlich Headroom).
 
+Async-Architektur (analog `news.py`): `refresh_funding_async()` macht den HTTP-Call,
+`is_funding_contra()` bleibt sync und liest nur den Cache.
+
 Bias-Modifier-Regeln (aus Vault):
   Rate > +0.10%  (8h)  → BTC Long ist überhitzt — Long-Entries als Kontradiktion markieren
   Rate < -0.05%  (8h)  → BTC Short überhitzt (Squeeze-Risiko) — Short-Entries als Kontradiktion
@@ -16,6 +19,7 @@ Bias-Modifier-Regeln (aus Vault):
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timedelta, timezone
 
@@ -34,48 +38,59 @@ CACHE_TTL_MIN = 30
 _ERROR_BACKOFF_MIN = 30
 
 _cache: dict = {"rate": None, "fetched_at": None, "last_error_at": None}
+_refresh_lock = asyncio.Lock()
 
 
-def _fetch_funding_rate() -> float | None:
-    """Holt aktuelle Funding-Rate von Binance, cached 30 Min."""
-    now = datetime.now(timezone.utc)
+def _cache_fresh(now: datetime | None = None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    return bool(
+        _cache["fetched_at"]
+        and now - _cache["fetched_at"] < timedelta(minutes=CACHE_TTL_MIN)
+    )
 
-    if (_cache["fetched_at"] and
-            now - _cache["fetched_at"] < timedelta(minutes=CACHE_TTL_MIN)):
-        return _cache["rate"]
 
-    if (_cache["last_error_at"] and
-            now - _cache["last_error_at"] < timedelta(minutes=_ERROR_BACKOFF_MIN)):
-        return _cache["rate"]   # alte Werte (oder None) zurückgeben
+def _in_error_backoff(now: datetime | None = None) -> bool:
+    now = now or datetime.now(timezone.utc)
+    return bool(
+        _cache["last_error_at"]
+        and now - _cache["last_error_at"] < timedelta(minutes=_ERROR_BACKOFF_MIN)
+    )
 
-    try:
-        with httpx.Client(timeout=8.0) as client:
-            resp = client.get(BINANCE_PREMIUM_URL, params={"symbol": SYMBOL})
-            resp.raise_for_status()
-            data = resp.json()
-            rate = float(data.get("lastFundingRate", 0))
-            _cache["rate"] = rate
-            _cache["fetched_at"] = now
-            _cache["last_error_at"] = None
-            log.info("BTC Funding-Rate: %.5f%% (8h-Periode)", rate * 100)
-            return rate
-    except Exception as e:
-        _cache["last_error_at"] = now
-        log.warning("Binance Funding-Fetch fehlgeschlagen (%dmin Backoff): %s",
-                    _ERROR_BACKOFF_MIN, e)
-        return _cache["rate"]
+
+async def refresh_funding_async() -> None:
+    """Refresh der BTC Funding-Rate via httpx.AsyncClient. Idempotent durch Cache."""
+    async with _refresh_lock:
+        now = datetime.now(timezone.utc)
+        if _cache_fresh(now) or _in_error_backoff(now):
+            return
+        try:
+            async with httpx.AsyncClient(timeout=8.0) as client:
+                resp = await client.get(BINANCE_PREMIUM_URL, params={"symbol": SYMBOL})
+                resp.raise_for_status()
+                data = resp.json()
+                rate = float(data.get("lastFundingRate", 0))
+                _cache["rate"] = rate
+                _cache["fetched_at"] = now
+                _cache["last_error_at"] = None
+                log.info("BTC Funding-Rate refreshed async: %.5f%% (8h)", rate * 100)
+        except Exception as e:
+            _cache["last_error_at"] = now
+            log.warning("Binance async-Fetch fehlgeschlagen (%dmin Backoff): %s",
+                        _ERROR_BACKOFF_MIN, e)
 
 
 def is_funding_contra(side: str) -> bool:
     """True wenn die aktuelle BTC Funding-Rate gegen die geplante Richtung läuft.
 
+    Cache-only — kein HTTP. Cache wird via refresh_funding_async() vom Tick-Loop
+    gefüllt. Bei leerem Cache → fail-open (False).
+
     Long bei Funding > +0.10% → True (Crowd überladen Long, Reversal-Risiko)
     Short bei Funding < -0.05% → True (Crowd überladen Short, Squeeze-Risiko)
     """
-    rate = _fetch_funding_rate()
+    rate = _cache.get("rate")
     if rate is None:
-        return False  # kein Datum → keine Kontradiktion (fail-open für seltenen Fall)
-
+        return False
     if side == "long" and rate > LONG_OVERHEAT:
         return True
     if side == "short" and rate < SHORT_OVERHEAT:
@@ -84,5 +99,5 @@ def is_funding_contra(side: str) -> bool:
 
 
 def get_funding_rate() -> float | None:
-    """Aktueller Wert für Dashboard/Logging."""
-    return _fetch_funding_rate()
+    """Aktueller Wert für Dashboard/Logging (Cache-only)."""
+    return _cache.get("rate")

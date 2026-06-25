@@ -29,7 +29,9 @@ from .state import (
     BotInstance, BotState, ClosedTrade, OpenTrade, TickLogEntry,
     save_state, _now,
 )
-from .trade_limits import TradeLimitsConfig, can_trade
+from . import notifier
+from .equity_filter import equity_filter_factor
+from .trade_limits import can_trade, correlation_gate_blocked, get_limits_for
 
 if TYPE_CHECKING:
     pass
@@ -38,6 +40,11 @@ log = logging.getLogger(__name__)
 
 SIGNAL_TICKS_INTERVAL = 5  # alle 5 Ticks Engine-Eval (bei 60s-Tick = 5min)
 LIVE_TFS = ["1d", "1h", "30m", "15m", "5m", "1m"]
+
+# Modul-State für Alert-Deduplizierung (BotInstance ist slots=True → kein
+# dynamisches Attribut möglich). Key: instrument-Name, Value: letzter Error
+# der via Telegram alarmiert wurde — gleicher Error löst nicht erneut aus.
+_last_alerted_error: dict[str, str] = {}
 
 
 async def run_tick_loop(
@@ -65,7 +72,18 @@ async def run_tick_loop(
             log.info("Tick-Loop %s abgebrochen", inst_name)
             raise
         except Exception as e:
-            log.exception("Tick-Loop %s Fehler: %s", inst_name, e)
+            # Transiente Netz-/DNS-/Read-Fehler nicht als Stack-Trace + Telegram-Alarm
+            # ausgeben — die sind erwartet bei Mac-Sleep / WiFi-Aussetzer und der
+            # Circuit-Breaker übernimmt das Throttling. Nur als WARNING loggen,
+            # damit der Log nicht 100× pro Outage zugespammt wird.
+            import httpx
+            is_transient = isinstance(e, (httpx.TransportError, OSError)) or \
+                isinstance(e, (CapitalAPIError, CapitalAuthError))
+            if is_transient:
+                log.warning("Tick-Loop %s transient: %s: %s",
+                            inst_name, type(e).__name__, str(e)[:120])
+            else:
+                log.exception("Tick-Loop %s Fehler: %s", inst_name, e)
             async with state_lock:
                 instance.last_error = f"{type(e).__name__}: {e}"
                 instance.append_tick_log(TickLogEntry(
@@ -76,6 +94,12 @@ async def run_tick_loop(
             await push_to_dashboard({
                 "type": "error", "instrument": inst_name, "message": str(e),
             })
+            # Telegram-Alert nur bei NICHT-transienten + NEUEN Errors
+            # (transient = Netz-Glitch, kommt + geht; kein Page-Wert).
+            err_snippet = str(e)[:200]
+            if not is_transient and _last_alerted_error.get(inst_name) != err_snippet:
+                await notifier.alert_critical_error(inst_name, str(e))
+                _last_alerted_error[inst_name] = err_snippet
 
         async with state_lock:
             instance.last_tick = tick_start
@@ -112,26 +136,41 @@ async def _do_tick(
     inst_name = instance.instrument
     eval_this_tick = (tick_count % SIGNAL_TICKS_INTERVAL == 1)
 
-    # ── 1. 1m-Bars laden — Catch-up: genug Bars seit Trade-Öffnung ───
+    # ── 1. 1m-Bars laden — gezielt Lücke seit letztem Tick + Puffer.
+    # `bars_needed` skaliert mit der Zeit seit `last_seen_bar` des ältesten
+    # offenen Trades — verhindert dass SL/TP-Hits in Outages übersehen werden,
+    # ohne wie historisches Backfill der Vergangenheit zu vertrauen.
     df_1m = pd.DataFrame()
     latest_bar = None
     try:
         import math
-        bars_needed = 50
+        bars_needed = 5
         if instance.open_trades:
-            oldest = min(t.open_time for t in instance.open_trades)
-            age_s = (_now() - oldest).total_seconds()
-            bars_needed = min(1000, max(50, math.ceil(age_s / 60) + 20))
+            oldest_seen = min(
+                (t.last_seen_bar or t.open_time) for t in instance.open_trades
+            )
+            gap_s = (_now() - oldest_seen).total_seconds()
+            # Lücke + 2min Puffer, gecappt bei 30 Bars (~30 min) — alles darüber
+            # ist eher Backfill als Live-Tick.
+            bars_needed = min(30, max(5, math.ceil(gap_s / 60) + 2))
         df_1m = await load_candles(inst_name, "1m", bars=bars_needed, refresh=True)
         latest_bar = df_1m.iloc[-1] if not df_1m.empty else None
     except (CapitalAuthError, CapitalAPIError) as e:
         log.warning("%s tick %d: 1m-Fetch fehlgeschlagen: %s", inst_name, tick_count, e)
 
     # ── 2. Offene Trades — Partial-Close + Catch-up (Bot/Partial-Close.md) ──
+    # Push-Payloads sammeln und NACH dem Lock-Release feuern — sonst blockiert
+    # ein langsamer Websocket-Client den state_lock und damit andere Bot-Instances.
+    push_queue: list[dict] = []
     if not df_1m.empty:
+        latest_seen = df_1m.index[-1].to_pydatetime()
+        if latest_seen.tzinfo is None:
+            from datetime import timezone as _tz
+            latest_seen = latest_seen.replace(tzinfo=_tz.utc)
         async with state_lock:
             still_open: list[OpenTrade] = []
             for trade in instance.open_trades:
+                trade.last_seen_bar = latest_seen   # für lückenloses Catch-up beim nächsten Tick
                 events = paper_broker.scan_with_partial_close(trade, df_1m)
                 full_closed = False
                 for ev in events:
@@ -141,46 +180,96 @@ async def _do_tick(
                             timestamp=trade.partial_close_time or _now(),
                             action="close", decision="partial_tp1",
                             variant=trade.variant,
-                            detail=(f"50% @ {trade.tp1:.2f} → +{ev['pnl']:.2f}, "
-                                    f"SL→BE ({trade.entry:.2f})"),
+                            detail=(f"{trade.pct1*100:.0f}% @ {trade.tp1:.2f} → "
+                                    f"+{ev['pnl']:.2f}, SL→BE ({trade.entry:.2f})"),
                             related_trade_id=trade.id,
                         ))
-                        log.info("%s PARTIAL_TP1 %s @ %.2f → +%.2f, SL→BE",
-                                 inst_name, trade.side, trade.tp1, ev["pnl"])
-                        await push_to_dashboard({
+                        log.info("%s PARTIAL_TP1 %s %.0f%% @ %.2f → +%.2f, SL→BE",
+                                 inst_name, trade.side, trade.pct1*100, trade.tp1, ev["pnl"])
+                        push_queue.append({
                             "type": "partial_close", "instrument": inst_name,
-                            "trade_id": trade.id, "tp1": trade.tp1, "pnl": ev["pnl"],
+                            "trade_id": trade.id, "level": "tp1",
+                            "price": trade.tp1, "pnl": ev["pnl"],
+                            "new_sl": trade.sl,
+                        })
+                    elif ev["kind"] == "partial_tp2":
+                        instance.equity += ev["pnl"]
+                        instance.append_tick_log(TickLogEntry(
+                            timestamp=trade.partial_close_time or _now(),
+                            action="close", decision="partial_tp2",
+                            variant=trade.variant,
+                            detail=(f"{trade.pct2*100:.0f}% @ {trade.tp2:.2f} → "
+                                    f"+{ev['pnl']:.2f}, SL→TP1 ({trade.tp1:.2f}) [Lock-Profit]"),
+                            related_trade_id=trade.id,
+                        ))
+                        log.info("%s PARTIAL_TP2 %s %.0f%% @ %.2f → +%.2f, SL→TP1",
+                                 inst_name, trade.side, trade.pct2*100, trade.tp2, ev["pnl"])
+                        push_queue.append({
+                            "type": "partial_close", "instrument": inst_name,
+                            "trade_id": trade.id, "level": "tp2",
+                            "price": trade.tp2, "pnl": ev["pnl"],
                             "new_sl": trade.sl,
                         })
                     elif ev["kind"] == "full_close":
+                        if any(c.id == trade.id for c in instance.closed_trades):
+                            log.warning("%s: Trade %s schon geschlossen — skip duplicate close",
+                                        inst_name, trade.id)
+                            full_closed = True
+                            continue
                         closed = paper_broker.close_position(
                             trade, ev["exit"], ev["bar"], ev["reason"], close_time=ev["ts"],
                         )
+                        # Equity-Buchung: nur Runner-Portion (closed.pnl_abs).
+                        # Partials wurden schon oben bei partial_tp1/tp2 gebucht.
                         instance.equity += closed.pnl_abs
-                        instance.closed_trades.append(closed)
-                        total_pnl = closed.pnl_abs + trade.partial_pnl
-                        risk_basis = abs(trade.original_sl - trade.entry) * (trade.original_size or trade.size)
-                        total_r = total_pnl / risk_basis if risk_basis > 0 else 0.0
+                        instance.append_closed_trade(closed)
+                        instance.setup_stage = "idle"  # FSM zurück auf Anfang
                         instance.append_tick_log(TickLogEntry(
                             timestamp=closed.close_time, action="close",
                             decision=f"closed_{ev['reason']}",
                             variant=closed.variant,
                             detail=(f"{closed.side} rest @ {closed.exit:.2f} → "
-                                    f"{closed.pnl_abs:+.2f} | total {total_pnl:+.2f} "
-                                    f"({total_r:+.2f}R)"),
+                                    f"{closed.pnl_abs:+.2f} | total {closed.total_pnl:+.2f} "
+                                    f"({closed.r_multiple:+.2f}R)"),
                             related_trade_id=closed.id,
                         ))
                         log.info("%s CLOSED %s %s rest %+.2f total %+.2f (%+.2fR)",
                                  inst_name, closed.side, closed.exit_reason,
-                                 closed.pnl_abs, total_pnl, total_r)
-                        await push_to_dashboard({
+                                 closed.pnl_abs, closed.total_pnl, closed.r_multiple)
+                        push_queue.append({
                             "type": "trade_closed", "instrument": inst_name,
                             "trade": closed.to_json(),
+                        })
+                        # Telegram-Alert (Fire-and-forget außerhalb des Locks).
+                        # Speichern wir als Payload, senden später.
+                        push_queue.append({
+                            "_telegram_close": True,
+                            "instrument": inst_name,
+                            "side": closed.side,
+                            "entry": closed.entry,
+                            "exit": closed.exit,
+                            "pnl": closed.total_pnl,
+                            "r_multiple": closed.r_multiple,
+                            "reason": closed.exit_reason,
+                            "equity": instance.equity,
                         })
                         full_closed = True
                 if not full_closed:
                     still_open.append(trade)
             instance.open_trades = still_open
+    # Push außerhalb des Locks — schneller Lock-Release auch wenn WS-Client träge ist.
+    # `_telegram_close` markiert Payloads die KEIN WS-Update sind, sondern ein
+    # Telegram-Alert (Trade-Close mit Equity-Snapshot).
+    for payload in push_queue:
+        if payload.get("_telegram_close"):
+            await notifier.alert_trade_closed(
+                instrument=payload["instrument"], side=payload["side"],
+                entry=payload["entry"], exit_price=payload["exit"],
+                pnl=payload["pnl"], r_multiple=payload["r_multiple"],
+                reason=payload["reason"], equity=payload["equity"],
+            )
+        else:
+            await push_to_dashboard(payload)
 
     # ── 3. Engine-Eval für neue Entries (nur alle N Ticks) ──────────
     if not eval_this_tick:
@@ -196,8 +285,9 @@ async def _do_tick(
         ))
         return
 
-    # Volle Trade-Limits-Pipeline (Bot/TradeGate.md, Bot/Trade-Limits.md)
-    cfg = TradeLimitsConfig(initial_capital=instance.initial_capital)
+    # Volle Trade-Limits-Pipeline (Bot/TradeGate.md, Bot/Trade-Limits.md) —
+    # per-Instrument-Config (BTC strikter als Indizes).
+    cfg = get_limits_for(inst_name, instance.initial_capital)
     allowed, reason = can_trade(_now(), inst_name, instance.equity,
                                  instance.closed_trades, cfg=cfg)
     if not allowed:
@@ -206,9 +296,65 @@ async def _do_tick(
             detail=reason or "unknown",
         ))
         log.info("%s Trade-Limit: %s", inst_name, reason)
+        # Telegram-Alert nur bei Daily-Loss-Limit (das ist das einzige
+        # Trade-Limit das einen User-Hinweis rechtfertigt)
+        if reason and "daily_loss_limit" in reason:
+            last_log = instance.tick_log[-2] if len(instance.tick_log) >= 2 else None
+            already_alerted = last_log and "daily_loss_limit" in (last_log.detail or "")
+            if not already_alerted:
+                pnl_today = sum(
+                    t.pnl_abs for t in instance.closed_trades
+                    if t.close_time.date() == _now().date()
+                )
+                loss_pct = abs(pnl_today / instance.initial_capital * 100)
+                await notifier.alert_daily_loss_limit(inst_name, instance.equity, loss_pct)
         return
 
+    # Portfolio-Korrelations-Gate (Indizes-Cluster max 2/3 gleichzeitig offen)
+    others_open = [n for n, o in state.instances.items()
+                   if n != inst_name and o.open_trades]
+    corr_blocked, corr_reason = correlation_gate_blocked(inst_name, others_open)
+    if corr_blocked:
+        instance.append_tick_log(TickLogEntry(
+            timestamp=_now(), action="skip", decision="correlation_gate",
+            detail=corr_reason or "",
+        ))
+        log.info("%s Korrelations-Gate: %s", inst_name, corr_reason)
+        return
+
+    # Equity-Curve-Filter (Vault/Bot/Equity-Curve-Filter.md): bei Drawdown
+    # automatisch Size reduzieren. Bei > 8% DD: gar kein neuer Trade.
+    _ec_factor, _ec_tier, _ec_dd_pct = equity_filter_factor(
+        instance.initial_capital,
+        instance.equity,
+        [t.pnl_abs for t in instance.closed_trades],
+    )
+    if _ec_factor <= 0:
+        instance.append_tick_log(TickLogEntry(
+            timestamp=_now(), action="skip", decision="equity_filter_severe_dd",
+            detail=f"dd={_ec_dd_pct:.1f}% — kein neuer Trade bis Recovery",
+        ))
+        log.warning("%s Equity-Curve-Filter: severe DD %.1f%% — skip", inst_name, _ec_dd_pct)
+        # Telegram-Alert nur einmal pro DD-Tag (heuristisch: nur wenn letzter
+        # tick_log-Eintrag NICHT auch schon severe_dd war)
+        last_log = instance.tick_log[-2] if len(instance.tick_log) >= 2 else None
+        if last_log is None or last_log.decision != "equity_filter_severe_dd":
+            await notifier.alert_drawdown_severe(inst_name, _ec_dd_pct, instance.equity)
+        return
+    if _ec_tier != "healthy":
+        log.info("%s Equity-Filter: %s dd=%.1f%% → size ×%.2f",
+                 inst_name, _ec_tier, _ec_dd_pct, _ec_factor)
+
     try:
+        # External-Data-Refresh (async, non-blocking, idempotent durch Cache).
+        # Engine.evaluate liest die News/Funding-Caches synchron — wir warmen
+        # sie hier auf, damit die Engine immer aktuelle Daten sieht.
+        from src.strategy_core import news as news_mod
+        from src.strategy_core import crypto_sentiment as crypto_mod
+        await news_mod.refresh_calendar_async()
+        if inst_name == "BTC":
+            await crypto_mod.refresh_funding_async()
+
         bars: dict[str, pd.DataFrame] = {}
         for tf in LIVE_TFS:
             df = await load_candles(inst_name, tf, bars=200)
@@ -222,12 +368,37 @@ async def _do_tick(
             ))
             return
 
+        # SMT-Reference-Bars für die HTF-Stufen laden (1h/30m/15m).
+        # Wenn das Mapping fehlt oder der Fetch fehlschlägt → SMT bleibt neutral.
+        from src.strategy_core import smt as smt_mod
+        ref_bars: dict[str, pd.DataFrame] | None = None
+        ref_inst = smt_mod.get_reference_instrument(inst_name)
+        if ref_inst:
+            ref_bars = {}
+            for htf in ("1h", "30m", "15m"):
+                try:
+                    df_ref = await load_candles(ref_inst, htf, bars=200)
+                    if not df_ref.empty:
+                        ref_bars[htf] = df_ref
+                except (CapitalAuthError, CapitalAPIError) as e:
+                    log.debug("%s: ref-bars %s/%s nicht ladbar: %s",
+                              inst_name, ref_inst, htf, e)
+
         bias = compute_bias(bars["1d"])
+        stage_tracker: list[str] = []
         signal = evaluate_signal(
             inst_name, bars,
             rr_threshold=instance.rr_threshold,
             sweep_lookback_bars=instance.sweep_lookback,
+            ref_bars=ref_bars,
+            stage_tracker=stage_tracker,
         )
+        # Höchste erreichte Stage = letztes Tracker-Element (= wo Engine
+        # entweder Signal gebaut hat oder gestoppt hat).
+        new_stage = stage_tracker[-1] if stage_tracker else "idle"
+        if new_stage != instance.setup_stage:
+            log.info("%s FSM: %s → %s", inst_name, instance.setup_stage, new_stage)
+            instance.setup_stage = new_stage
 
         if signal is None:
             instance.append_tick_log(TickLogEntry(
@@ -242,11 +413,11 @@ async def _do_tick(
 
         current_bar = latest_bar if latest_bar is not None else bars["5m"].iloc[-1]
 
-        # Combined Size-Multiplikator: OPEX × Conviction-Grade
+        # Combined Size-Multiplikator: OPEX × Conviction-Grade × Equity-Filter
         from src.strategy_core import sessions as sessions_mod
         _opex_mult = sessions_mod.opex_size_multiplier(_now().date())
         _conv_mult = getattr(signal, "size_multiplier", 1.0)
-        _effective_risk = instance.risk_pct * _opex_mult * _conv_mult
+        _effective_risk = instance.risk_pct * _opex_mult * _conv_mult * _ec_factor
 
         new_trade = paper_broker.open_position(
             signal, instance.equity, _effective_risk, current_bar,
@@ -270,6 +441,7 @@ async def _do_tick(
                 log.info("%s: zwischenzeitlich Position eröffnet — skip", inst_name)
                 return
             instance.open_trades.append(new_trade)
+            instance.setup_stage = "in_trade"
             instance.append_tick_log(TickLogEntry(
                 timestamp=_now(), action="open",
                 decision=f"opened_{signal.variant}",
@@ -288,6 +460,12 @@ async def _do_tick(
         log.info("%s OPENED %s %s %s @ %.2f SL=%.2f TP=%.2f RR=%.2f",
                  inst_name, new_trade.side, new_trade.id, new_trade.variant,
                  new_trade.entry, new_trade.sl, new_trade.tp, new_trade.rr_at_open)
+        await notifier.alert_trade_opened(
+            instrument=inst_name, side=new_trade.side,
+            entry=new_trade.entry, sl=new_trade.sl, tp=new_trade.tp,
+            rr=new_trade.rr_at_open, variant=new_trade.variant,
+            conviction=signal.conviction_grade,
+        )
         await push_to_dashboard({
             "type": "trade_opened", "instrument": inst_name,
             "trade": new_trade.to_json(),

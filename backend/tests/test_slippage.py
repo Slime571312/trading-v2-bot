@@ -6,23 +6,28 @@ from src.backtest.slippage import (
 )
 
 
-def test_estimate_slippage_zero_range():
-    # Keine Range = keine Slippage
-    assert estimate_slippage(100.0, 100.0, 100.0) == 0.0
+def test_estimate_slippage_zero_range_unknown_instrument():
+    # Unbekanntes Instrument + Zero-Range → 3 bps Fallback / 2 = 1.5 bps
+    assert estimate_slippage(100.0, 100.0, 100.0) == pytest.approx(0.00015)
 
 
-def test_estimate_slippage_typical_index():
-    # Typischer DE40-Bar: 25272 Close, Range 30 Pkt → ~0.083 % Slippage
-    slip = estimate_slippage(25272.0, 25290.0, 25260.0)
-    # spread_proxy = 30/25272 ≈ 0.00119 → × 0.7 ≈ 0.00083
-    assert 0.0005 < slip < 0.002
+def test_estimate_slippage_typical_de40():
+    # DE40 SPREAD_ABS=1.5pt bei 25272 → 1.5/2 / 25272 ≈ 0.0000297 = 0.003%
+    slip = estimate_slippage(25272.0, 25290.0, 25260.0, instrument="DE40")
+    assert 0.00002 < slip < 0.0001
 
 
-def test_estimate_slippage_volatile_btc():
-    # BTC-Bar mit 200-Pkt Range: höhere Slippage
-    slip = estimate_slippage(76900.0, 77000.0, 76800.0)
-    # spread_proxy = 200/76900 ≈ 0.0026 → × 0.7 ≈ 0.00182
-    assert 0.001 < slip < 0.003
+def test_estimate_slippage_btc_realistic_price():
+    # BTC SPREAD_ABS=50 USD bei 76900 → 50/2 / 76900 ≈ 0.000325
+    slip = estimate_slippage(76900.0, 77000.0, 76800.0, instrument="BTC")
+    assert 0.0002 < slip < 0.0006
+
+
+def test_estimate_slippage_btc_widening_in_high_volatility():
+    """Bei sehr volatiler Bar (range > base_spread) dominiert range × 5%."""
+    # Range 5000 USD → max(50, 5000*0.05=250) = 250 → /2 / 76900 ≈ 0.00163
+    slip = estimate_slippage(76900.0, 79000.0, 74000.0, instrument="BTC")
+    assert slip > 0.001  # range-getrieben, deutlich höher als Base
 
 
 def test_entry_slippage_long_pays_more():
