@@ -28,7 +28,7 @@ from src.live.confidence_reeval import re_evaluate_confidence_tier, adjust_posit
 from . import paper_broker
 from .state import (
     BotInstance, BotState, ClosedTrade, OpenTrade, TickLogEntry,
-    save_state, _now,
+    save_state, strip_tick_log, _now,
 )
 from . import notifier
 from .equity_filter import equity_filter_factor
@@ -52,13 +52,21 @@ async def run_tick_loop(
     state: BotState,
     instance: BotInstance,
     state_lock: asyncio.Lock,
+    start_delay_s: float = 0.0,
 ) -> None:
     """Endlos bis `instance.running=False`. Pro Tick: SL/TP-Check + ggf. Eval.
 
     `state_lock` ist GLOBAL (1 Lock für die ganze BotState), damit
     save_state() serialisiert ist.
+
+    `start_delay_s` staffelt den Start gegen die anderen Instanzen. Ohne das
+    tickten alle gleichzeitig und der 5-Tick-Eval-Zyklus feuerte ~42 Capital-
+    Calls in unter einer Sekunde gegen ein ~10 req/s-Limit → 429er.
     """
     inst_name = instance.instrument
+    if start_delay_s > 0:
+        log.info("Tick-Loop %s startet in %.1fs (Stagger)", inst_name, start_delay_s)
+        await asyncio.sleep(start_delay_s)
     log.info("Tick-Loop %s gestartet (interval=%ds)", inst_name, instance.tick_interval_s)
 
     tick_count = 0
@@ -114,7 +122,7 @@ async def run_tick_loop(
         # Push State-Update zum Browser
         await push_to_dashboard({
             "type": "instance_update", "instrument": inst_name,
-            "instance": instance.to_json(),
+            "instance": strip_tick_log(instance),
         })
 
         elapsed = (_now() - tick_start).total_seconds()
@@ -278,22 +286,24 @@ async def _do_tick(
     # Fix 2026-06-26: vorher 180 Ticks bei 60s-Interval = 3h statt 15min.
     if tick_count % 15 == 0 and instance.open_trades and not df_1m.empty:
         reeval_queue: list[dict] = []
+        # Bars VOR dem Lock laden: load_candles backofft bei 429 bis zu 120s,
+        # und state_lock ist global über alle Instanzen (orchestrator.py:25).
+        # Innerhalb des Locks hätte eine 429-Welle alle 6 Bots blockiert.
+        bars_for_reeval: dict[str, pd.DataFrame] = {}
+        for tf in ["1d", "1h", "5m", "1m"]:
+            try:
+                if tf == "1m":
+                    bars_for_reeval[tf] = df_1m
+                else:
+                    df_tf = await load_candles(inst_name, tf, bars=50)
+                    if not df_tf.empty:
+                        bars_for_reeval[tf] = df_tf
+            except Exception as e:
+                log.debug("%s: %s-bars für re-eval nicht geladen: %s",
+                         inst_name, tf, str(e)[:50])
+
         async with state_lock:
             try:
-                # Load all TF-bars for gate evaluation
-                bars_for_reeval: dict[str, pd.DataFrame] = {}
-                for tf in ["1d", "1h", "5m", "1m"]:
-                    try:
-                        if tf == "1m":
-                            bars_for_reeval[tf] = df_1m
-                        else:
-                            df_tf = await load_candles(inst_name, tf, bars=50)
-                            if not df_tf.empty:
-                                bars_for_reeval[tf] = df_tf
-                    except Exception as e:
-                        log.debug("%s: %s-bars für re-eval nicht geladen: %s",
-                                 inst_name, tf, str(e)[:50])
-
                 for position in instance.open_trades:
                     old_tier = position.confidence_tier_at_open or "A"
                     try:

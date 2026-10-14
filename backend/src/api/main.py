@@ -40,6 +40,18 @@ from src.strategy_core.sweep import detect_sweeps
 
 logging.basicConfig(level=config.log_level.upper())
 
+# Log-Volumen-Reduktion (Sprint 2026-08-10): drei häufigste Log-Quellen bremsen
+# damit /tmp/trading-v2-bot.launchd.err nicht in 36-MB-Files wächst.
+#   - httpx.INFO-Requests: bei jedem Tick 8-10 GET-Requests, alle mit URL. Redundant.
+#   - src.data.fetcher "Fetched X Kerzen" bei jedem Tick pro TF pro Instrument
+#     = ~30 INFO-Zeilen/Tick × 60 Ticks/Min × 4 Instrumente = 7200 Zeilen/Min in
+#     Volllast. Auf WARNING gesetzt: nur echte Fetch-Probleme werden geloggt.
+#   - src.data.signal_cache: transient-WARNINGs bei DNS-Aussetzern kommen bereits
+#     als WARNING; behalten wir. Aber der 60s-Refresh-Log ist redundant.
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+logging.getLogger("src.data.fetcher").setLevel(logging.WARNING)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -61,8 +73,25 @@ async def lifespan(app: FastAPI):
     # 4 Gates VOR Auto-Resume: Config-Validation, Schema-Check,
     # Position-Reconciliation (DB ↔ Capital), Pre-Flight Capital-Ping.
     # Auto-Resume passiert nur wenn alle 4 Gates grün sind.
+    # Hartes 30s-Timeout damit der Backend bei Capital-Outage trotzdem hochfährt.
     from src.live import startup as startup_mod
-    startup_result = await startup_mod.run_startup_sequence(orch)
+    try:
+        startup_result = await asyncio.wait_for(
+            startup_mod.run_startup_sequence(orch), timeout=30.0,
+        )
+    except asyncio.TimeoutError:
+        log_app.warning(
+            "Startup-Sequenz Timeout nach 30s (Capital wahrscheinlich down) — "
+            "Backend startet ohne Auto-Resume.",
+        )
+        startup_result = startup_mod.StartupResult()
+        startup_result.config_ok = True
+        startup_result.schema_ok = True
+        startup_result.reconciliation_ok = False
+        startup_result.reconciliation_message = "startup_timeout"
+        startup_result.capital_ok = False
+        startup_result.capital_message = "startup_timeout"
+        startup_result.can_auto_resume = False
     startup_mod.set_last_result(startup_result)
 
     if not startup_result.can_auto_resume:
@@ -254,7 +283,7 @@ class CandlesResponse(BaseModel):
 
 
 # Literal-Listen aus den Mapping-Dicts ableiten, damit FastAPI sie als Enum validiert
-InstrumentName = Literal["DE40", "NASDAQ", "SP500", "BTC"]
+InstrumentName = Literal["DE40", "NASDAQ", "SP500", "BTC", "GOLD", "EURUSD"]
 Timeframe = Literal["1m", "5m", "15m", "30m", "1h", "4h", "1d", "1w"]
 
 
@@ -850,10 +879,8 @@ class BotInstanceResponse(BaseModel):
 
 
 def _instance_to_response(inst) -> BotInstanceResponse:
-    d = inst.to_json()
-    d.pop("tick_log", None)
-    d["n_tick_log"] = len(inst.tick_log)
-    return BotInstanceResponse(**d)
+    from src.live.state import strip_tick_log
+    return BotInstanceResponse(**strip_tick_log(inst))
 
 
 class BotOverviewResponse(BaseModel):
@@ -1342,10 +1369,13 @@ async def news_upcoming(instrument: InstrumentName, hours: int = 24) -> dict:
 @app.websocket("/ws/live")
 async def ws_live(ws: WebSocket) -> None:
     """WebSocket für Live-Updates — sendet initial alle Instanzen, dann Push pro Event."""
+    from src.live.state import strip_tick_log
     orch = get_orchestrator()
     initial = {
         "type": "snapshot",
-        "instances": {k: v.to_json() for k, v in orch.state.instances.items()},
+        "instances": {
+            k: strip_tick_log(v) for k, v in orch.state.instances.items()
+        },
     }
     await ws_hub.handle_client(ws, initial_message=initial)
 

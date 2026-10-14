@@ -30,7 +30,7 @@ ARCHIVE_DIR = STATE_DIR / "archive"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 ARCHIVE_DIR.mkdir(parents=True, exist_ok=True)
 
-DEFAULT_INSTRUMENTS = ["DE40", "NASDAQ", "SP500", "BTC"]
+DEFAULT_INSTRUMENTS = ["DE40", "NASDAQ", "SP500", "BTC", "GOLD", "EURUSD"]
 TICK_LOG_MAX = 200          # zirkular, älteste fallen raus
 CLOSED_TRADES_HOT_MAX = 500 # nur die jüngsten N im JSON-State, Rest in Archive (.parquet via to_csv)
 
@@ -366,7 +366,7 @@ class BotInstance:
 
     @classmethod
     def from_json(cls, d: dict) -> "BotInstance":
-        return cls(
+        inst = cls(
             instrument=d["instrument"],
             running=d.get("running", False),
             was_running=d.get("was_running", False),
@@ -386,6 +386,10 @@ class BotInstance:
             tick_log=[TickLogEntry.from_json(t) for t in d.get("tick_log", [])],
             setup_stage=d.get("setup_stage", "idle"),
         )
+        # Post-Load: BTC + neue Instrumente nutzen sweep_lookback=20
+        if inst.instrument in ["BTC", "GOLD", "EURUSD"]:
+            inst.sweep_lookback = 20
+        return inst
 
 
 @dataclass(slots=True)
@@ -424,11 +428,24 @@ class BotState:
         )
 
 
+def strip_tick_log(inst: "BotInstance") -> dict:
+    """Instance als dict ohne den tick_log, nur mit dessen Länge.
+
+    Das Frontend liest ausschließlich `n_tick_log` und holt die Einträge
+    selbst über /bot/{i}/ticks. Der Log macht ~76 KB pro Instanz aus, also
+    71 % des Payloads — er darf nicht in Snapshots oder Tick-Pushes landen.
+    """
+    d = inst.to_json()
+    d.pop("tick_log", None)
+    d["n_tick_log"] = len(inst.tick_log)
+    return d
+
+
 # ── Defaults / Migration ────────────────────────────────────────────────
 
 
 def _fresh_state() -> BotState:
-    """4 leere Instanzen für die Default-Instrumente. BTC bekommt strengere Defaults."""
+    """6 leere Instanzen für die Default-Instrumente. BTC strikte Defaults, GOLD/EURUSD mittlere."""
     state = BotState()
     for name in DEFAULT_INSTRUMENTS:
         inst = state.ensure(name)
@@ -436,6 +453,9 @@ def _fresh_state() -> BotState:
             # BTC-Hardening: strengeres RR-Gate, längeres Sweep-Lookback,
             # passt zu A-only Filter + min_sl_pct=0.5% im Broker.
             inst.rr_threshold = 2.5
+            inst.sweep_lookback = 20
+        elif name in ("GOLD", "EURUSD"):
+            # Neue Instrumente: sweep_lookback=20 (wie Backtest-Testing)
             inst.sweep_lookback = 20
     return state
 
@@ -477,6 +497,11 @@ def load_state() -> BotState:
         # Fehlende Default-Instrumente nachziehen
         for inst_name in DEFAULT_INSTRUMENTS:
             state.ensure(inst_name)
+        # Post-Processing: sweep_lookback für spezielle Instrumente setzen
+        # BTC und neue Instrumente (GOLD, EURUSD) nutzen sweep_lookback=20
+        for inst_name in ["BTC", "GOLD", "EURUSD"]:
+            if inst_name in state.instances:
+                state.instances[inst_name].sweep_lookback = 20
         return state
     except (json.JSONDecodeError, KeyError, ValueError) as e:
         log.error("State-Datei korrupt (%s) — frischer State", e)
@@ -523,7 +548,10 @@ def save_state(state: BotState) -> None:
     try:
         fd, tmp_path = tempfile.mkstemp(dir=STATE_DIR, prefix=".live_state.", suffix=".tmp")
         with os.fdopen(fd, "w", encoding="utf-8") as f:
-            json.dump(state.to_json(), f, indent=2, default=str)
+            # Compact statt indent=2: die Datei wird pro Tick pro Instanz neu
+            # geschrieben (6×/min), indent kostete 35 % Bytes und 74 % CPU.
+            # `jq` rendert compact JSON unverändert lesbar.
+            json.dump(state.to_json(), f, separators=(",", ":"), default=str)
         os.replace(tmp_path, STATE_FILE)
         tmp_path = None
     finally:

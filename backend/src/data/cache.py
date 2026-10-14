@@ -49,10 +49,26 @@ def read(instrument: str, tf: str) -> pd.DataFrame | None:
         return None
 
 
+_MAX_CACHED_BARS = 1000
+
+
 def write(instrument: str, tf: str, df: pd.DataFrame) -> None:
-    """Atomar via Tempfile + rename, damit ein abgebrochener Schreibvorgang
-    den vorhandenen Cache nicht korrumpiert."""
+    """Merged `df` in den vorhandenen Cache, atomar via Tempfile + rename.
+
+    Gemerged statt überschrieben, weil der Tick-Loop 1m nur mit 5 Bars holt,
+    Eval und SignalCache aber 200 wollen. Ein Overwrite machte den Cache
+    dauerhaft zu kurz → `read()` traf nie die geforderte Bar-Zahl und jeder
+    Read wurde zum echten API-Call.
+    """
     p = _path(instrument, tf)
+    merged = df
+    existing = read(instrument, tf)
+    if existing is not None and not existing.empty:
+        # Neue Bars gewinnen bei gleichem Timestamp (letzte Kerze ist noch offen).
+        merged = pd.concat([existing, df])
+        merged = merged[~merged.index.duplicated(keep="last")].sort_index()
+        merged = merged.tail(_MAX_CACHED_BARS)
+
     tmp = p.with_suffix(".csv.tmp")
-    df.to_csv(tmp)
+    merged.to_csv(tmp)
     tmp.replace(p)

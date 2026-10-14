@@ -91,8 +91,13 @@ class BotOrchestrator:
             inst.last_error = None
             save_state(self.state)
 
+        # Start gegen die bereits laufenden Instanzen staffeln, damit die
+        # Eval-Ticks nicht alle in dieselbe Sekunde fallen (Capital-429er).
+        stagger_s = (len(self._tasks) * inst.tick_interval_s) / max(
+            len(self.state.instances), 1
+        )
         task = asyncio.create_task(
-            run_tick_loop(self.state, inst, self._state_lock),
+            run_tick_loop(self.state, inst, self._state_lock, start_delay_s=stagger_s),
             name=f"bot_loop_{instrument}",
         )
         self._tasks[instrument] = task
