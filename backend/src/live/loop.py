@@ -177,16 +177,15 @@ async def _do_tick(
                 for ev in events:
                     if ev["kind"] == "partial_tp1":
                         instance.equity += ev["pnl"]
-                        # DON'T MOVE SL! Let it stay at original (protect remaining 50%)
                         instance.append_tick_log(TickLogEntry(
                             timestamp=trade.partial_close_time or _now(),
                             action="close", decision="partial_tp1",
                             variant=trade.variant,
                             detail=(f"{trade.pct1*100:.0f}% @ {trade.tp1:.2f} → "
-                                    f"+{ev['pnl']:.2f}, SL unchanged (protect TP2)"),
+                                    f"+{ev['pnl']:.2f}, SL→BE ({trade.entry:.2f})"),
                             related_trade_id=trade.id,
                         ))
-                        log.info("%s PARTIAL_TP1 %s %.0f%% @ %.2f → +%.2f, SL unchanged",
+                        log.info("%s PARTIAL_TP1 %s %.0f%% @ %.2f → +%.2f, SL→BE",
                                  inst_name, trade.side, trade.pct1*100, trade.tp1, ev["pnl"])
                         push_queue.append({
                             "type": "partial_close", "instrument": inst_name,

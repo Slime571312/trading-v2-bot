@@ -34,11 +34,10 @@ _W_REGIME = 0.15
 _W_R_FORECAST = 0.15
 
 # Confidence-Tiers für Position-Size-Modulation
-# ERHÖHT 2026-10-14: 50% → 60% (zu viele losing trades mit niedrig confidence)
-_TIER_SKIP_BELOW = 0.60      # < 60 % → kein Trade (ERHÖHT von 50%)
-_TIER_REDUCED_BELOW = 0.75   # 60–75 % → 0.7× (SHIFTED up)
-_TIER_NORMAL_BELOW = 0.87    # 75–87 % → 1.0× (SHIFTED up)
-                              # ≥ 87 % → 1.25× (mit R-Forecast)
+_TIER_SKIP_BELOW = 0.50      # < 50 % → kein Trade
+_TIER_REDUCED_BELOW = 0.70   # 50–70 % → 0.7×
+_TIER_NORMAL_BELOW = 0.85    # 70–85 % → 1.0×
+                              # ≥ 85 % → 1.25× (mit R-Forecast)
 _SIZE_MULT_REDUCED = 0.7
 _SIZE_MULT_NORMAL = 1.0
 # Tier-High-Boost am 27.06. wieder auf 1.25 angehoben, weil der R-Forecast als

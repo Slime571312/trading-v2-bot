@@ -578,10 +578,9 @@ def evaluate(
     _conf_breakdown["sweep_quality"] = round(_sweep_score, 3)
     _conf_breakdown["sweep_mult"] = round(_sweep_mult, 3)
     # Skip 1: RAW-Confidence unter Schwelle (compute_confidence lieferte 0)
-    # ERHÖHT 2026-10-14: 50% → 60% (too many losing trades with low confidence)
     if _conf_size_mult == 0.0:
         log.info(
-            "evaluate %s: confidence %.0f%% < 60%% — skip (mtf=%.2f rr=%.2f conv=%.2f reg=%.2f ens=%.2f)",
+            "evaluate %s: confidence %.0f%% < 50%% — skip (mtf=%.2f rr=%.2f conv=%.2f reg=%.2f ens=%.2f)",
             instrument, _confidence * 100,
             _conf_breakdown["mtf"], _conf_breakdown["rr"],
             _conf_breakdown["conviction"], _conf_breakdown["regime"],
