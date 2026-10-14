@@ -177,15 +177,16 @@ async def _do_tick(
                 for ev in events:
                     if ev["kind"] == "partial_tp1":
                         instance.equity += ev["pnl"]
+                        # DON'T MOVE SL! Let it stay at original (protect remaining 50%)
                         instance.append_tick_log(TickLogEntry(
                             timestamp=trade.partial_close_time or _now(),
                             action="close", decision="partial_tp1",
                             variant=trade.variant,
                             detail=(f"{trade.pct1*100:.0f}% @ {trade.tp1:.2f} → "
-                                    f"+{ev['pnl']:.2f}, SL→BE ({trade.entry:.2f})"),
+                                    f"+{ev['pnl']:.2f}, SL unchanged (protect TP2)"),
                             related_trade_id=trade.id,
                         ))
-                        log.info("%s PARTIAL_TP1 %s %.0f%% @ %.2f → +%.2f, SL→BE",
+                        log.info("%s PARTIAL_TP1 %s %.0f%% @ %.2f → +%.2f, SL unchanged",
                                  inst_name, trade.side, trade.pct1*100, trade.tp1, ev["pnl"])
                         push_queue.append({
                             "type": "partial_close", "instrument": inst_name,
@@ -272,10 +273,11 @@ async def _do_tick(
         else:
             await push_to_dashboard(payload)
 
-    # ── 2b. Confidence-Tier Re-Evaluation (alle 15min = 180 Ticks à 5s) ─────
+    # ── 2b. Confidence-Tier Re-Evaluation (alle 15 Ticks @ 60s = 15min) ─────
     # Mid-trade: re-check 3 gates (regime, structure, momentum) und adjust
     # Position-Risk wenn Tier schlecht wird (A→B, B→C, etc.)
-    if tick_count % 180 == 0 and instance.open_trades and not df_1m.empty:
+    # Fix 2026-06-26: vorher 180 Ticks bei 60s-Interval = 3h statt 15min.
+    if tick_count % 15 == 0 and instance.open_trades and not df_1m.empty:
         reeval_queue: list[dict] = []
         async with state_lock:
             try:
@@ -297,18 +299,22 @@ async def _do_tick(
                     old_tier = position.confidence_tier_at_open or "A"
                     try:
                         new_tier = re_evaluate_confidence_tier(position, bars_for_reeval)
-                        if new_tier != old_tier:
+                        # Re-Eval-Tier (A/B/C/D) ist eine andere Skala als das
+                        # initial gespeicherte Score-Tier (high/normal/reduced/skip).
+                        # Statt jeden Refresh als "Change" zu loggen, nur dann
+                        # eingreifen wenn das Re-Eval-Ergebnis tatsächlich kritisch
+                        # ist (≥ 2 Gates gefailt = C oder D).
+                        if new_tier in ("C", "D"):
                             log.info(
-                                "Confidence re-eval %s: %s → %s",
-                                position.id, old_tier, new_tier
+                                "Confidence re-eval %s: critical tier=%s (entry=%s)",
+                                position.id, new_tier, old_tier,
                             )
-                            # Adjust position (SL tighter, TP adjusted, etc.)
                             adjust_position_for_tier(position, new_tier)
                             instance.append_tick_log(TickLogEntry(
                                 timestamp=_now(),
                                 action="confidence_re_eval",
-                                decision=f"{old_tier} → {new_tier}",
-                                detail=f"gates re-checked, position risk adjusted",
+                                decision=f"gate_fail_{new_tier}",
+                                detail=f"entry={old_tier} → reeval={new_tier}, SL adjusted",
                                 related_trade_id=position.id,
                             ))
                             reeval_queue.append({

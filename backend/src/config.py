@@ -108,6 +108,8 @@ EPIC_MAP: dict[str, str] = {
     "SP500": "US500",
     "BTC": "BTCUSD",
     "ETH": "ETHUSD",   # SMT-Reference für BTC (Crypto-Twin)
+    "GOLD": "GOLD",    # Commodities: Gold (XAUUSD war 404, GOLD ist valid)
+    "EURUSD": "EURUSD",  # Forex: EUR/USD
 }
 
 # ─── TF-Mapping: Playbook-String → Capital-Resolution ────────────────────
@@ -122,6 +124,38 @@ RESOLUTION_MAP: dict[str, str] = {
     "1d": "DAY",
     "1w": "WEEK",
 }
+
+# ─── Asset-Spezifische Parameter (2026-10-14) ────────────────────
+# Nach Web-Research + Live-Tests: Verschiedene Assets brauchen unterschiedliche
+# RR-Thresholds + Lookbacks. GOLD (100% WR mit 1.3 RR) vs NASDAQ (17% WR mit 2.0 RR)
+ASSET_CONFIG: dict[str, dict] = {
+    "GOLD": {
+        "rr_threshold": 1.3,      # Commodities haben kleinere Moves
+        "sweep_lookback_high_vol": 12,  # London/NY
+        "sweep_lookback_low_vol": 8,    # Tokyo/Sydney
+        "min_sl_distance": 0.25,  # GOLD-spezifisch
+        "confidence_min": 0.60,   # +5% higher (60% statt default)
+    },
+    "EURUSD": {
+        "rr_threshold": 1.8,      # Forex: mittlerer RR
+        "sweep_lookback_high_vol": 20,
+        "sweep_lookback_low_vol": 10,
+        "min_sl_distance": 0.50,
+        "confidence_min": 0.60,
+    },
+    # Default für Indizes (DE40, NASDAQ, SP500, BTC)
+    "default": {
+        "rr_threshold": 2.0,      # Original (aber Win-Rate zu niedrig!)
+        "sweep_lookback_high_vol": 20,
+        "sweep_lookback_low_vol": 10,
+        "min_sl_distance": 0.50,
+        "confidence_min": 0.65,   # +15% higher als default (stricter!)
+    }
+}
+
+def get_asset_config(instrument: str) -> dict:
+    """Get asset-specific config or default."""
+    return ASSET_CONFIG.get(instrument, ASSET_CONFIG["default"])
 
 
 def to_epic(instrument: str) -> str:

@@ -178,6 +178,32 @@ def session_label(ts: pd.Timestamp, instrument: str) -> str:
     return "closed"
 
 
+# ── Instrument-Spezifische Session-Exclusions ────────────────────────────────
+# Quick-Wins 2026-09-29: Session-Filter zur Vermeidung unprofitabler Sessions
+
+SESSION_EXCLUSIONS: dict[str, list[str]] = {
+    "DE40": ["london"],   # London-Session: -€275 PnL, 0% WR → rausnehmen
+    "SP500": ["london"],  # London-Session: -€80 PnL, -52% WR → rausnehmen
+    "NASDAQ": [],         # Kein Filter (67,2% WR, best performer)
+    "BTC": [],            # 24/7 Crypto, kein Filter
+}
+
+
+def should_skip_session(ts: pd.Timestamp, instrument: str) -> bool:
+    """True wenn aktuelle Session für dieses Instrument excluded ist.
+
+    Quick-Win Quick-Wins 2026-09-29:
+    - DE40: London rausnehmen (-€275 impact)
+    - SP500: London rausnehmen (-€80 impact)
+    """
+    excluded = SESSION_EXCLUSIONS.get(instrument, [])
+    if not excluded:
+        return False
+
+    curr_label = session_label(ts, instrument)
+    return curr_label in excluded
+
+
 # ── OPEX-Calendar (Bot/OPEX-Calendar.md) ──────────────────────────────────
 
 
@@ -257,3 +283,68 @@ def is_silver_bullet_window(ts: pd.Timestamp, window: str = "ny_am") -> bool:
 def is_any_silver_bullet_window(ts: pd.Timestamp) -> bool:
     """True wenn in irgendeinem der 3 Silver-Bullet-Fenster."""
     return any(is_silver_bullet_window(ts, w) for w in SILVER_BULLET_WINDOWS)
+
+
+# ── Forex Sessions (V1 Feature: Dynamic Sweep Lookback) ──────────────────────
+# EURUSD-spezifische Session-Windows für Liquidität + Volatilität.
+# Sweep-Lookback anpassen basierend auf Session-Liquidität:
+# - London/NY: sweep_lookback=20 (hohe Liquidität, zuverlässig)
+# - Tokyo/Sydney: sweep_lookback=10 (geringere Liquidität, weniger Noise)
+
+FOREX_SESSIONS_UTC = {
+    "tokyo": (0, 8),       # 00:00-08:00 UTC (9:00-17:00 JST)
+    "london": (8, 17),     # 08:00-17:00 UTC (8:00-17:00 GMT/BST)
+    "ny": (13, 22),        # 13:00-22:00 UTC (8:00-17:00 EST/EDT)
+    "sydney": (22, 24),    # 22:00-24:00 UTC (09:00+ AEDT) — wraps to next day
+}
+
+def forex_session_label(ts: pd.Timestamp) -> str | None:
+    """Returns Forex session ('tokyo', 'london', 'ny', 'sydney') or None if closed."""
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    ts_utc = ts.tz_convert("UTC")
+    hour = ts_utc.hour
+
+    # Sydney wraps midnight
+    if hour >= 22:
+        return "sydney"
+    elif 0 <= hour < 8:
+        return "tokyo"
+    elif 8 <= hour < 17:
+        return "london"
+    elif 13 <= hour < 22:
+        return "ny"
+    return None
+
+
+def dynamic_sweep_lookback_forex(ts: pd.Timestamp, instrument: str = "EURUSD") -> int:
+    """
+    V1 Feature: Dynamisch sweep_lookback basierend auf Forex-Session-Liquidität.
+
+    - London/NY: 20 bars (hohe Liquidität, tiefer Lookback für HTF-Patterns)
+    - Tokyo/Sydney: 10 bars (weniger Liquidität, flacherer Lookback)
+    """
+    if instrument != "EURUSD":
+        return dynamic_sweep_lookback_commodity(ts, instrument)
+
+    session = forex_session_label(ts)
+    if session in ("london", "ny"):
+        return 20
+    return 10  # Tokyo, Sydney, off-hours
+
+
+def dynamic_sweep_lookback_commodity(ts: pd.Timestamp, instrument: str = "GOLD") -> int:
+    """
+    Commodity-optimierte sweep_lookback (Basislookback kleiner als Forex).
+
+    - London/NY high-vol: 12 bars (Commodities haben tightere Patterns)
+    - Tokyo/Sydney low-vol: 8 bars (noch enger bei wenig Liquidität)
+    - GOLD spez.: sweep_lookback immer 12 (nicht 20)
+    """
+    if instrument != "GOLD":
+        return 10  # Fallback für andere Commodities
+
+    session = forex_session_label(ts)
+    if session in ("london", "ny"):
+        return 12  # GOLD in High-Vol Sessions
+    return 8  # GOLD in Low-Vol (Tokyo/Sydney/off-hours)
