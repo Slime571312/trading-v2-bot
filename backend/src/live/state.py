@@ -98,6 +98,12 @@ class OpenTrade:
     # `last_seen_bar` statt einfach die letzten 5 — verhindert dass SL/TP-Hits
     # in der Lücke übersehen werden, ohne historisches Backfill als Lookahead.
     last_seen_bar: datetime | None = None
+    # Früheste Bar, die den Trade auflösen darf. `open_time` ist die Label-Zeit
+    # der Signal-Bar (LTF, meist 5m), der SL/TP-Scan läuft aber auf 1m — die
+    # 1m-Bars innerhalb und nach dieser 5m-Bar existierten beim Öffnen bereits
+    # und hätten den Ausgang vorbestimmt. scan_from ist die neueste beim Öffnen
+    # verfügbare 1m-Bar; nur spätere Bars dürfen den Trade schließen.
+    scan_from: datetime | None = None
     # GSL-Decision (Vault/Bot/GSL-Manager.md): "regular" | "guaranteed" | "trailing"
     # Im Paper-Mode nur informativ. Beim späteren Live-Switch wird das in den
     # Capital.com Order-Body als `guaranteedStop=true` übersetzt.
@@ -120,6 +126,7 @@ class OpenTrade:
         d["open_time"] = _iso(self.open_time)
         d["partial_close_time"] = _iso(self.partial_close_time)
         d["last_seen_bar"] = _iso(self.last_seen_bar)
+        d["scan_from"] = _iso(self.scan_from)
         d["stop_type"] = self.stop_type
         return d
 
@@ -143,6 +150,7 @@ class OpenTrade:
             partial_pnl=d.get("partial_pnl", 0.0),
             partial_close_time=_parse_iso(d.get("partial_close_time")),
             last_seen_bar=_parse_iso(d.get("last_seen_bar")),
+            scan_from=_parse_iso(d.get("scan_from")),
             stop_type=d.get("stop_type", "regular"),
             session_at_open=d.get("session_at_open"),
             atr_regime_at_open=d.get("atr_regime_at_open"),

@@ -32,7 +32,12 @@ def _normalize_prices(prices: list[dict]) -> pd.DataFrame:
         ask = p.get("openPrice", {}).get("ask")
         if bid is None or ask is None:
             continue
-        ts = p.get("snapshotTime") or p.get("snapshotTimeUTC")
+        # snapshotTimeUTC zuerst: Capital liefert beide Felder naiv (ohne
+        # Offset), `snapshotTime` aber in Börsen-Ortszeit. Vorher stand
+        # snapshotTime vorn, und pd.to_datetime(utc=True) *stempelt* UTC auf
+        # einen naiven Timestamp statt umzurechnen — jede Kerze war damit um
+        # den Berlin-Offset (Okt: +2h) in die Zukunft datiert.
+        ts = p.get("snapshotTimeUTC") or p.get("snapshotTime")
         rows.append({
             "time": pd.to_datetime(ts, utc=True),
             "open": (p["openPrice"]["bid"] + p["openPrice"]["ask"]) / 2,

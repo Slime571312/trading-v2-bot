@@ -108,10 +108,22 @@ def open_position(
     # im Backtest = die historische Bar. Das macht Trade-Holdtime-Analysen
     # konsistent statt sie zwischen den beiden Modi ~30-60s zu verschieben.
     from datetime import timezone as _tz
-    _open_time = signal.time
-    if isinstance(_open_time, pd.Timestamp):
-        _open_time = (_open_time.to_pydatetime().replace(tzinfo=_tz.utc)
-                      if _open_time.tzinfo is None else _open_time.to_pydatetime())
+
+    def _to_dt(v):
+        if isinstance(v, pd.Timestamp):
+            return (v.to_pydatetime().replace(tzinfo=_tz.utc)
+                    if v.tzinfo is None else v.to_pydatetime())
+        return v
+
+    _open_time = _to_dt(signal.time)
+
+    # scan_from = jüngste beim Öffnen verfügbare Bar. signal.time ist die
+    # LTF-Bar (meist 5m); der SL/TP-Scan läuft auf 1m und würde sonst die
+    # 1m-Bars innerhalb/nach dieser 5m-Bar mitlesen, die hier schon vorliegen.
+    # Genau dadurch schlossen Trades im selben Tick mit vorbekanntem Ausgang.
+    _scan_from = _to_dt(getattr(current_bar, "name", None))
+    if _scan_from is not None and _open_time is not None and _scan_from < _open_time:
+        _scan_from = _open_time
 
     # GSL-Decision (Vault/Bot/GSL-Manager.md): grobe Holdtime-Schätzung
     # 4 h für Indizes (Average der historischen Trades-Statistik), 6 h für BTC.
@@ -148,6 +160,7 @@ def open_position(
         pct3=pct3,
         original_size=size,
         original_sl=signal.sl,
+        scan_from=_scan_from,
         stop_type=chosen_stop,
         # Trade-Journal-Snapshot (vom Engine vorbefüllt)
         session_at_open=signal.session_label,
@@ -276,7 +289,7 @@ def trail_sl_behind_pivots(
     # Pivots erst NACH dem letzten partial_close suchen, sonst trailen wir
     # auf Pivots VOR TP2-Hit (was den SL gegen die ursprüngliche TP1-Lock zurückziehen
     # könnte oder über den TP-Pfad hinaus).
-    cutoff = trade.partial_close_time or trade.open_time
+    cutoff = trade.partial_close_time or trade.scan_from or trade.open_time
     bars_after = bars[bars.index > cutoff]
     if len(bars_after) < 3:
         return False
@@ -339,7 +352,7 @@ def scan_exit_over_bars(
     Für Trades die NICHT die Partial-Close-Mechanik nutzen (Legacy / Tests).
     Gibt (hit_bar, exit_price_raw, reason, bar_timestamp) zurück, oder None.
     """
-    bars_after = bars[bars.index > trade.open_time]
+    bars_after = bars[bars.index > (trade.scan_from or trade.open_time)]
     for ts, bar in bars_after.iterrows():
         result = check_intrabar_exit(trade, bar)
         if result is not None:
@@ -369,7 +382,10 @@ def scan_with_partial_close(
     Mutiert `trade` in-place (size, sl, tp1_hit, tp2_hit, partial_pnl).
     """
     events: list[dict] = []
-    cutoff = trade.partial_close_time or trade.open_time
+    # scan_from vor open_time: Letzteres ist die LTF-Bar-Beschriftung, deren
+    # 1m-Bars beim Öffnen bereits vorlagen (Lookahead). Fallback auf open_time
+    # nur für Trades aus der Zeit vor diesem Feld.
+    cutoff = trade.partial_close_time or trade.scan_from or trade.open_time
     bars_after = bars[bars.index > cutoff]
     no_runner = trade.pct3 <= 0.0
 
