@@ -75,7 +75,9 @@ def calmar_ratio(
     mdd = max_drawdown(equity_curve)
     if mdd == 0:
         return None
-    return total_r / abs(mdd) / 100.0   # /100 weil mdd in Anteil, nicht Prozent
+    # max_drawdown() liefert bereits einen Anteil (-0.23 = -23 %), also nicht
+    # zusätzlich durch 100 teilen — das machte den Wert 100× zu klein.
+    return total_r / abs(mdd)
 
 
 def omega_ratio(r_multiples: Sequence[float], threshold: float = 0.0) -> float | None:

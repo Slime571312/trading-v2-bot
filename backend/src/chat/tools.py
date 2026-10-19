@@ -138,7 +138,10 @@ async def _impl_get_recent_trades(args: dict[str, Any]) -> dict:
                 "instrument": t.instrument, "side": t.side,
                 "entry": t.entry, "exit": t.exit,
                 "r": round(t.r_multiple, 2),
-                "pnl": round(t.pnl_abs, 2),
+                # total_pnl, nicht pnl_abs: Letzteres ist bei Multi-TP-
+                # Teilverkäufen 0.0 (~30 % der Trades) und zeigte dem User
+                # 0,00 € neben einem korrekten R im selben Payload.
+                "pnl": round(t.total_pnl if t.total_pnl is not None else t.pnl_abs, 2),
                 "reason": t.exit_reason,
                 "variant": t.variant,
                 "open": t.open_time.isoformat() if t.open_time else None,

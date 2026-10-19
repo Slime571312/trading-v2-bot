@@ -1102,7 +1102,9 @@ def _compute_stats(inst) -> BotStatsResponse:
     for t in sorted_closed:
         # total_pnl deckt Partials + Runner. Legacy-Records (vor Multi-TP-Fix)
         # haben total_pnl == pnl_abs, sind also rückwärtskompatibel.
-        trade_pnl = t.total_pnl if t.total_pnl else t.pnl_abs
+        # `is not None` statt Truthiness: ein echter Breakeven-Trade mit
+        # total_pnl == 0.0 fiele sonst auf das kontaminierte pnl_abs zurück.
+        trade_pnl = t.total_pnl if t.total_pnl is not None else t.pnl_abs
         eq += trade_pnl
         cum_pnl += trade_pnl
         curve.append({
